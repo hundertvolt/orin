@@ -123,8 +123,27 @@ def handle_request_error(request_id: Optional[str], code: ErrorCode, message: An
 request_queue: "queue.Queue[Any]" = queue.Queue()
 SHUTDOWN_SENTINEL = object()
 shutdown_event = threading.Event()
-active_responses: Dict[str, http.client.HTTPConnection] = {}
 active_responses_lock = threading.Lock()
+
+class ActiveGeneration:
+    """Tracks an in-flight Ollama call so shutdown can interrupt it.
+
+    http.client's getresponse() closes and nulls HTTPConnection.sock as
+    soon as it reads a response with no Content-Length (true for our
+    streamed NDJSON responses) - "passing" the live socket to the
+    response object instead. So conn.sock can't be relied on to reach
+    the connection once streaming has started. We capture the raw
+    socket reference right after connect(), before getresponse() can
+    null it, and shut that down directly - the underlying socket object
+    stays valid (only conn's reference to it is cleared) and its
+    shutdown() call still interrupts a thread blocked reading it.
+    """
+
+    def __init__(self, conn: http.client.HTTPConnection) -> None:
+        self.conn = conn
+        self.sock: Optional[socket.socket] = None
+
+active_responses: Dict[str, ActiveGeneration] = {}
 
 class GenerationCancelled(Exception):
     """Raised when an in-flight Ollama generation is aborted due to shutdown."""
@@ -223,14 +242,16 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
     chunk_count = 0
 
     conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=OLLAMA_CONNECT_TIMEOUT)
+    active_call = ActiveGeneration(conn)
 
     with active_responses_lock:
-        active_responses[request.request_id] = conn
+        active_responses[request.request_id] = active_call
 
     try:
         try:
             conn.connect()
             conn.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
+            active_call.sock = conn.sock  # capture before getresponse() can null conn.sock
 
             conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
@@ -239,6 +260,7 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
                 error_body = resp.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"Ollama returned HTTP {resp.status}: {error_body}")
 
+            stream_completed = False
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line:
@@ -263,7 +285,17 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
 
                 if chunk.get("done"):
                     final_meta = chunk
+                    stream_completed = True
                     break
+
+            if not stream_completed:
+                # The connection ended (closed/reset/EOF) before Ollama sent a
+                # final "done" chunk - the caller must not mistake this
+                # truncated output for a complete response.
+                raise RuntimeError(
+                    f"Ollama stream ended unexpectedly after {chunk_count} chunk(s) "
+                    "without a final 'done' marker"
+                )
         finally:
             with active_responses_lock:
                 active_responses.pop(request.request_id, None)
@@ -382,14 +414,14 @@ finally:
     request_queue.put(SHUTDOWN_SENTINEL)
 
     with active_responses_lock:
-        for conn in list(active_responses.values()):
+        for call in list(active_responses.values()):
             try:
-                if conn.sock is not None:
-                    conn.sock.shutdown(socket.SHUT_RDWR)
+                if call.sock is not None:
+                    call.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass  # already closed/disconnected - nothing to unblock
             try:
-                conn.close()
+                call.conn.close()
             except OSError:
                 pass  # already closed/disconnected - nothing to clean up
 

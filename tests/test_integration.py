@@ -251,23 +251,15 @@ def test_ollama_error_reported_without_crashing_service(service_factory, probe_c
 
 def test_graceful_shutdown_while_generation_in_flight(service_factory, probe_client, fake_ollama):
     """Exercises the active_responses cleanup loop in the shutdown block for
-    real: a generation is mid-stream when SIGTERM arrives, and the process
-    must still exit cleanly within --shutdown-timeout.
+    real: a generation is mid-stream when SIGTERM arrives.
 
-    This also captures a discovered (pre-existing, not introduced by our
-    changes) limitation: the shutdown block's
-    `if conn.sock is not None: conn.sock.shutdown(...)` unblock trick
-    cannot actually reach a real Ollama streaming connection, because
-    http.client's own getresponse() already nulls conn.sock right after
-    reading headers (proven directly in
-    test_conn_sock_is_none_once_streaming_has_started). So the worker
-    thread handling a stuck generation is never woken up for a graceful
-    GenerationCancelled - it's abandoned as a daemon thread once
-    worker_thread.join(timeout=SHUTDOWN_TIMEOUT) expires. The process
-    still exits cleanly and within --shutdown-timeout (the join has its
-    own timeout regardless), so this is not a hang or crash - but the
-    in-flight request's caller gets no response at all, and the
-    "cancelled due to shutdown" log line never fires in this scenario.
+    The shutdown block's unblock mechanism tracks the raw socket
+    (ActiveGeneration.sock, captured right after connect() before
+    getresponse() can null conn.sock) rather than conn.sock itself, so
+    it can still reach and interrupt a real, actively-streaming Ollama
+    connection. That should produce a genuine graceful cancellation -
+    "cancelled due to shutdown" - rather than the process abandoning a
+    stuck daemon thread and exiting without ever processing it.
     """
     fake_ollama.scenario = "hang"
     fake_ollama.hang_seconds = 30
@@ -292,12 +284,9 @@ def test_graceful_shutdown_while_generation_in_flight(service_factory, probe_cli
     assert rc == 0, svc.text()
     assert elapsed < 8, f"shutdown took {elapsed:.1f}s, longer than --shutdown-timeout allows"
     assert "Shutdown complete." in svc.text()
-    assert "Worker thread did not finish within" in svc.text(), (
-        "expected the known daemon-thread-abandonment path; if this now "
-        "says 'cancelled due to shutdown' instead, the unblock mechanism "
-        "has been fixed and this test (and its docstring) should be "
-        "updated to assert the graceful-cancellation path instead"
-    )
+    assert "cancelled due to shutdown" in svc.text()
+    assert "Worker thread exited cleanly." in svc.text()
+    assert "Worker thread did not finish within" not in svc.text()
 
 
 def test_broker_restart_reconnects_and_resumes_serving(fake_ollama, tmp_path):

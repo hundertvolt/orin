@@ -157,9 +157,9 @@ def test_conn_close_oserror_does_not_hide_original_exception(loaded_module, monk
 
 
 def test_registered_in_active_responses_while_in_flight(loaded_module, fake_ollama):
-    """While a generation is streaming, its connection must be reachable
-    via active_responses under the request_id key, and removed again
-    once the call completes (successfully or not)."""
+    """While a generation is streaming, its ActiveGeneration entry must be
+    reachable via active_responses under the request_id key, and removed
+    again once the call completes (successfully or not)."""
     m = loaded_module
     fake_ollama.scenario = "hang"
     fake_ollama.hang_seconds = 30  # longer than this test; we force-close instead of waiting it out
@@ -182,6 +182,7 @@ def test_registered_in_active_responses_while_in_flight(loaded_module, fake_olla
             time.sleep(0.02)
         assert fake_ollama.received_requests, "request never reached the fake Ollama server"
         assert "hang-1" in m.active_responses
+        assert m.active_responses["hang-1"].conn is not None
     finally:
         # The server never finishes this stream (no "done" chunk), so force
         # the connection closed to end the test deterministically instead of
@@ -194,33 +195,41 @@ def test_registered_in_active_responses_while_in_flight(loaded_module, fake_olla
         t.join(timeout=10)
 
     assert not t.is_alive()
-    # Notable (pre-existing, not introduced by our changes) behavior: a
-    # connection closed mid-stream with no "done" chunk is NOT treated as
-    # an error - `for line in resp` just sees EOF and stops. The caller
-    # gets a clean-looking partial result instead of an exception.
-    assert "value" in result_holder
-    assert result_holder["value"]["response"] == "partial-"
+    # A connection closed mid-stream with no "done" chunk is treated as an
+    # error, not a silent partial success.
+    assert "error" in result_holder
+    assert isinstance(result_holder["error"], RuntimeError)
+    assert "without a final 'done' marker" in str(result_holder["error"])
     assert m.active_responses == {}
 
 
-def test_conn_sock_is_none_once_streaming_has_started(loaded_module, fake_ollama):
-    """Documents why the finally-block close() needed guarding, and why the
-    shutdown block's `if conn.sock is not None: conn.sock.shutdown(...)`
-    check matters: our NDJSON responses have no Content-Length, so
-    http.client's getresponse() itself closes and nulls conn.sock right
-    after reading headers (it has no other way to know where the body
-    ends) - well before the body/streaming even starts. A shutdown-time
-    unblock via conn.sock therefore cannot rely on conn.sock being live;
-    the production code's None-check is what keeps that path safe."""
+def test_active_generation_sock_survives_getresponse_and_unblocks_read(loaded_module, fake_ollama):
+    """Direct regression test for the shutdown-cancellation fix.
+
+    http.client's getresponse() nulls conn.sock right after reading
+    headers for our NDJSON responses (no Content-Length), "passing" the
+    live socket to the response object instead - proven by
+    active_responses[id].conn.sock being None below. The fix is to
+    capture the raw socket into ActiveGeneration.sock right after
+    connect(), before getresponse() can null conn.sock. That captured
+    reference must still be genuinely usable to shut down the
+    connection and unblock a thread mid-read - not just non-None.
+    """
     m = loaded_module
     fake_ollama.scenario = "hang"
-    fake_ollama.hang_seconds = 5
+    fake_ollama.hang_seconds = 30
     m.OLLAMA_HOST = "127.0.0.1"
     m.OLLAMA_PORT = fake_ollama.server_address[1]
 
-    t = threading.Thread(
-        target=m.stream_ollama_generate, args=(_make_request(m, request_id="hang-2"),), daemon=True
-    )
+    result_holder = {}
+
+    def run():
+        try:
+            result_holder["value"] = m.stream_ollama_generate(_make_request(m, request_id="hang-2"))
+        except Exception as e:
+            result_holder["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
     t.start()
     try:
         deadline = time.monotonic() + 5
@@ -229,25 +238,27 @@ def test_conn_sock_is_none_once_streaming_has_started(loaded_module, fake_ollama
         assert fake_ollama.received_requests
 
         deadline = time.monotonic() + 2
-        conn = m.active_responses.get("hang-2")
-        while time.monotonic() < deadline and conn is not None and conn.sock is not None:
+        call = m.active_responses.get("hang-2")
+        while time.monotonic() < deadline and call is not None and call.sock is None:
             time.sleep(0.02)
-            conn = m.active_responses.get("hang-2")
+            call = m.active_responses.get("hang-2")
 
-        assert conn is not None
-        assert conn.sock is None
-    finally:
-        # conn.sock is already None, so we can't unblock the read the way
-        # the shutdown block would; force it from the server side instead
-        # so this test doesn't leave a thread blocked for the full
-        # OLLAMA_STREAM_IDLE_TIMEOUT (120s default) after the test ends.
+        assert call is not None
+        assert call.conn.sock is None, "conn.sock should already be nulled by getresponse()"
+        assert call.sock is not None, "ActiveGeneration.sock must still hold the captured reference"
+
+        # This is exactly what the production shutdown block does.
         m.shutdown_event.set()
-        if fake_ollama.last_connection is not None:
-            try:
-                fake_ollama.last_connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        try:
-            t.join(timeout=10)
-        finally:
-            m.shutdown_event.clear()
+        start = time.monotonic()
+        call.sock.shutdown(socket.SHUT_RDWR)
+        t.join(timeout=5)
+        elapsed = time.monotonic() - start
+
+        assert not t.is_alive(), "shutdown() on the captured socket did not unblock the read"
+        assert elapsed < 2, f"unblock took {elapsed:.2f}s, expected near-instant"
+        assert isinstance(result_holder.get("error"), m.GenerationCancelled), (
+            f"expected GenerationCancelled, got {result_holder}"
+        )
+    finally:
+        m.shutdown_event.clear()
+        t.join(timeout=5)
