@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 
 import argparse
+import http.client
 import json
 import logging
+import queue
 import signal
+import socket
+import threading
 import time
-import requests
 
 import paho.mqtt.client as mqtt
-from jtop import jtop
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from pydantic import BaseModel, Field, ValidationError
 
 # ------------------------------
 # Command-line arguments
@@ -25,7 +30,10 @@ parser.add_argument("--credpath", help="LoadCredential path for MQTT password")
 parser.add_argument("--topic", default="orin/ollama", help="MQTT topic to publish and receive")
 parser.add_argument("--ollama-host", default="localhost", help="Ollama host address (default: localhost)")
 parser.add_argument("--ollama-port", type=int, default="11434", help="Ollama host address (default: 11434)")
-
+parser.add_argument("--connect-timeout", type=float, default=5.0, help="Max seconds to establish Ollama TCP connection")
+parser.add_argument("--stream-timeout", type=float, default=120.0, help="Max seconds of silence between streamed chunks")
+parser.add_argument("--shutdown-timeout", type=float, default=5.0, help=("Max seconds to full service shutdown")
+parser.add_argument("--loglevel", default="INFO", choices=logChoices, help="Logging level")
 args = parser.parse_args()
 
 MQTT_BROKER: str = args.broker
@@ -33,18 +41,92 @@ MQTT_PORT: int = args.port
 MQTT_TOPIC: str = args.topic
 USERNAME: Optional[str] = args.username
 CRED_PATH = Path(args.credpath) if args.credpath else None
-OLLAMA_URL: str = f"http://{args.ollama_host}:{args.ollama_port}/api/generate"
+OLLAMA_HOST: str = args.ollama_host
+OLLAMA_PORT: int = args.ollama_port
+OLLAMA_PATH: str = "/api/generate"
+OLLAMA_CONNECT_TIMEOUT: float = args.connect_timeout
+OLLAMA_STREAM_IDLE_TIMEOUT: float = args.stream_timeout
+SHUTDOWN_TIMEOUT: float = args.shutdown_timeout
 
 # ------------------------------
 # Logging setup
 # ------------------------------
-
 logging.basicConfig(
     level=getattr(logging, args.loglevel.upper(), logging.INFO),
-    format="[%(levelname)s] [%(name)s] %(message)s"
+    format="[%(levelname)s] [%(threadName)s] [%(name)s] %(message)s"
 )
 
 log = logging.getLogger("ollama_mqtt")
+threading.current_thread().name = "main"
+
+# ------------------------------
+# Request schema and error codes
+# ------------------------------
+
+class ErrorCode(IntEnum):
+    OK = 0
+    INVALID_JSON = 1
+    VALIDATION_ERROR = 2
+    OLLAMA_ERROR = 3
+
+class OllamaRequest(BaseModel):
+    request_id: str = Field(strict=True)
+    model: str = Field(strict=True)
+    system: str = Field(strict=True)
+    user: str = Field(strict=True)
+    temperature: Optional[float] = Field(default=None, strict=True)
+    top_p: Optional[float] = Field(default=None, strict=True)
+    top_k: Optional[int] = Field(default=None, strict=True)
+
+    def to_ollama_options(self) -> Dict[str, Any]:
+        return self.model_dump(include={"temperature", "top_p", "top_k"}, exclude_none=True)
+
+def format_validation_error(exc: ValidationError) -> str:
+    # Collapses pydantic's structured error list into a single string,
+    # e.g. "temperature: value is not a valid float; user: field required"
+    parts = []
+    for err in exc.errors(include_url=False, include_context=False):
+        loc = ".".join(str(p) for p in err["loc"]) or "<root>"
+        parts.append(f"{loc}: {err['msg']}")
+    return "; ".join(parts)
+
+def publish_response(
+    request_id: str, message: str, error_code: ErrorCode, error_message: str
+) -> None:
+    payload = {
+        "request_id": request_id,
+        "message": message,
+        "error_code": int(error_code),
+        "error_message": error_message,
+    }
+    try:
+        info = client.publish(f"{MQTT_TOPIC}/response", json.dumps(payload), qos=1)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            log.warning(f"Publish returned error code: {info.rc} for request_id={request_id}")
+    except Exception as e:
+        log.error(f"Failed to publish response for request_id={request_id}: {e}")
+
+def handle_request_error(request_id: Optional[str], code: ErrorCode, message: Any) -> None:
+    error_message = str(message)
+    log.error(f"[error_code={int(code)}] request_id={request_id}: {error_message}")
+
+    if request_id is None:
+        log.debug("No request_id available; skipping MQTT error response.")
+        return
+
+    publish_response(request_id, message="", error_code=code, error_message=error_message)
+
+# ------------------------------
+# Request queue
+# ------------------------------
+request_queue: "queue.Queue[Any]" = queue.Queue()
+SHUTDOWN_SENTINEL = object()
+shutdown_event = threading.Event()
+active_responses: Dict[str, http.client.HTTPConnection] = {}
+active_responses_lock = threading.Lock()
+
+class GenerationCancelled(Exception):
+    """Raised when an in-flight Ollama generation is aborted due to shutdown."""
 
 # ------------------------------
 # MQTT setup
@@ -64,59 +146,172 @@ def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason
     else:
         log.info("MQTT disconnected cleanly")
 
-def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage):
+def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
     try:
         raw = msg.payload.decode("utf-8")
-        log.info(f"Received message on {msg.topic}: {raw}")
+    except Exception as e:
+        log.error(f"Failed to decode message payload: {e}")
+        return
+
+    log.info(f"Received message on {msg.topic}: {raw}")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        handle_request_error(request_id=None, code=ErrorCode.INVALID_JSON, message=str(e))
+        return
+
+    fallback_id = data.get("request_id") if isinstance(data, dict) else None
+
+    try:
+        request = OllamaRequest.model_validate(data)
+    except ValidationError as e:
+        handle_request_error(
+            request_id=fallback_id,
+            code=ErrorCode.VALIDATION_ERROR,
+            message=format_validation_error(e),
+        )
+        return
+
+    request_queue.put(request)
+    log.debug(
+        f"Queued request_id={request.request_id} "
+        f"(queue depth={request_queue.qsize()})"
+    )
+
+# ------------------------------
+# Ollama worker
+# ------------------------------
+
+def build_ollama_payload(request: OllamaRequest) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": request.model,
+        "system": request.system,
+        "prompt": request.user,
+        "stream": True,
+    }
+
+    options = request.to_ollama_options()
+    if options:
+        payload["options"] = options
+
+    return payload
+
+def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
+    payload = build_ollama_payload(request)
+    body = json.dumps(payload).encode("utf-8")
+
+    response_parts = []
+    thinking_parts = []  # some reasoning models stream a separate "thinking" field
+    final_meta: Dict[str, Any] = {}
+
+    start = time.monotonic()
+    last_progress_log = start
+    chunk_count = 0
+
+    conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=OLLAMA_CONNECT_TIMEOUT)
+
+    with active_responses_lock:
+        active_responses[request.request_id] = conn
+
+    try:
+        try:
+            conn.connect()
+            conn.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
+
+            conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+
+            if resp.status != 200:
+                error_body = resp.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Ollama returned HTTP {resp.status}: {error_body}")
+
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                chunk_count += 1
+
+                if chunk.get("response"):
+                    response_parts.append(chunk["response"])
+                if chunk.get("thinking"):
+                    thinking_parts.append(chunk["thinking"])
+
+                now = time.monotonic()
+                if now - last_progress_log >= 5.0:
+                    log.info(
+                        f"Still generating request_id={request.request_id}: "
+                        f"{chunk_count} chunks, "
+                        f"{sum(len(p) for p in response_parts)} chars so far "
+                        f"({now - start:.1f}s elapsed)"
+                    )
+                    last_progress_log = now
+
+                if chunk.get("done"):
+                    final_meta = chunk
+                    break
+        finally:
+            with active_responses_lock:
+                active_responses.pop(request.request_id, None)
+            conn.close()
+
+    except Exception:  # catch all exceptions and explicitly classify for deliberate cancellation
+        if shutdown_event.is_set():
+            raise GenerationCancelled() from None
+        raise
+
+    return {
+        "response": "".join(response_parts),
+        "thinking": "".join(thinking_parts) if thinking_parts else None,
+        **{k: v for k, v in final_meta.items() if k not in ("response", "thinking")},
+    }
+
+
+def ollama_worker() -> None:
+    log.info("Worker thread started")
+    while True:
+        request = request_queue.get()  # blocks / waits if empty
+
+        if request is SHUTDOWN_SENTINEL:
+            log.info("Shutdown sentinel received, exiting worker loop")
+            request_queue.task_done()
+            break
+
+        if shutdown_event.is_set():  # drain queue on shutdown
+            log.info(f"Discarding queued request_id={request.request_id} due to shutdown")
+            request_queue.task_done()
+            continue
 
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            log.error("Invalid JSON received")
-            return
+            log.info(f"Calling Ollama for request_id={request.request_id}")
+            result = stream_ollama_generate(request)
+            log.info(f"Ollama response for {request.request_id}: {result}")
 
-        error = OllamaRequestValidator.validate(data)
-        if error:
-            log.error(f"Validation error: {error}")
-            return
+            publish_response(
+                request.request_id,
+                message=result.get("response", ""),
+                error_code=ErrorCode.OK,
+                error_message="OK",
+            )
 
-        payload = {
-            "model": data["model"],
-            "system": data["system"],
-            "prompt": data["user"],
-            "stream": False,
-        }
+        except GenerationCancelled:
+            log.info(f"Generation for request_id={request.request_id} cancelled due to shutdown")
+        except (OSError, http.client.HTTPException, RuntimeError) as e:
+            handle_request_error(request.request_id, ErrorCode.OLLAMA_ERROR, str(e))
+        except Exception as e:
+            handle_request_error(request.request_id, ErrorCode.OLLAMA_ERROR, f"unexpected error: {e}")
+        finally:
+            request_queue.task_done()
 
-        # Add optional parameters if present
-        if "temperature" in data:
-            payload["temperature"] = data["temperature"]
-        if "top_p" in data:
-            payload["top_p"] = data["top_p"]
-        if "top_k" in data:
-            payload["top_k"] = data["top_k"]
-
-        log.info(f"Calling Ollama for request_id={data['request_id']}")
-
-        response = requests.post(OLLAMA_URL, json=payload, timeout=60)
-        response.raise_for_status()
-
-        result = response.json()
-
-        log.info(f"Ollama response for {data['request_id']}: {result}")
-
-        # You can publish the result back if needed
-        # client.publish(RESPONSE_TOPIC, json.dumps(...))
-
-    except Exception as e:
-        log.error(f"Error handling message: {e}")
+    log.info("Worker thread stopped")
 
 
+# ------------------------------
+# MQTT client instantiation
+# ------------------------------
 
-
-
-client = mqtt.Client(client_id="ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-# client.max_queued_messages_set(5)
-# client.will_set(MQTT_TOPIC, json.dumps({"heartbeat": 0, "status": "offline"}), qos=1, retain=True)
+client = mqtt.Client(client_id="orin_ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
 client.on_connect = on_connect
 client.on_disconnect = on_disconnect
@@ -141,112 +336,53 @@ except Exception as e:
     log.error(f"Initial MQTT connect failed: {e}")
     raise  # let systemd restart
 
-client.loop_start()  # background loop handles reconnects
+client.loop_start()  # background thread handles the network loop and reconnects
 
 # ------------------------------
-# Helper functions
+# Worker thread startup
 # ------------------------------
+worker_thread = threading.Thread(target=ollama_worker, name="ollama-worker", daemon=True)
+worker_thread.start()  # running as daemon makes OS cancel the thread as last resort on timeout
 
-class OllamaRequestValidator:
-    REQUIRED_FIELDS = {
-        "request_id": str,
-        "model": str,
-        "system": str,
-        "user": str,
-    }
-
-    OPTIONAL_FIELDS = {
-        "temperature": (int, float),
-        "top_p": (int, float),
-        "top_k": int,
-    }
-
-    @classmethod
-    def validate(cls, data: Dict[str, Any]) -> Optional[str]:
-        # Check required fields
-        for field, expected_type in cls.REQUIRED_FIELDS.items():
-            if field not in data:
-                return f"Missing required field: {field}"
-            if not isinstance(data[field], expected_type):
-                return f"Field '{field}' must be of type {expected_type.__name__}"
-
-        # Check optional fields
-        for field, expected_type in cls.OPTIONAL_FIELDS.items():
-            if field in data and not isinstance(data[field], expected_type):
-                if isinstance(expected_type, tuple):
-                    expected = ", ".join(t.__name__ for t in expected_type)
-                else:
-                    expected = expected_type.__name__
-                return f"Field '{field}' must be of type {expected}"
-
-        return None  # valid
-
-    @classmethod
-    def extract(cls, data: Dict[str, Any]) -> Dict[str, Any]:
-        # Returns a cleaned dict with only known fields
-        result = {k: data[k] for k in cls.REQUIRED_FIELDS if k in data}
-        for k in cls.OPTIONAL_FIELDS:
-            if k in data:
-                result[k] = data[k]
-        return result
-
-
-
-
-
-
-
-
-
-def publish_telemetry(jetson: jtop) -> None:
-    try:
-
-        payload_str = json.dumps(payload)
-        log.debug(f"Generated payload: {payload_str}")
-        if client.is_connected():
-            log.debug(f"Publishing to topic {MQTT_TOPIC}")
-            info = client.publish(MQTT_TOPIC, payload_str, qos=1, retain=False)
-            if info.rc != mqtt.MQTT_ERR_SUCCESS:
-                log.warning(f"Publish returned error code: {info.rc}")
-        else:
-            log.debug(f"Not publishing; client is not connected!")
-    except Exception as e:
-        log.error(f"Telemetry publish error: {e}")
-
+# ------------------------------
+# Shutdown handling
+# ------------------------------
 
 def handle_exit(signum: int, frame: Optional[Any]) -> None:
     log.info(f"Received signal {signum}, shutting down...")
-    raise SystemExit
+    shutdown_event.set()
 
 signal.signal(signal.SIGTERM, handle_exit)
 signal.signal(signal.SIGINT, handle_exit)
 
-# ------------------------------
-# Main loop using jtop
-# ------------------------------
+log.info(f"Ollama MQTT bridge started, listening on '{MQTT_TOPIC}/request'.")
 
 try:
-    with jtop() as jetsonTop:
-        log.info(f"Telemetry service started using topic: {MQTT_TOPIC}.")
-        while True:
-            # publish_telemetry(jetsonTop)
-            # time.sleep(PUBLISH_INTERVAL)
-
-except SystemExit:
-    log.debug("SystemExit received, stopping main loop.")
-
-except Exception as e:
-    log.error(f"Error in main loop: {e}")
-
+    shutdown_event.wait() # Main thread parks here
 finally:
-    log.info("Stopping MQTT loop and disconnecting...")
-    try:
-        if client.is_connected():
-            info = client.publish(MQTT_TOPIC, json.dumps({"heartbeat": 0, "status": "offline"}), qos=1, retain=True)
-            info.wait_for_publish(timeout=2.0)  # ensure the message is sent
-            log.debug("Offline payload published.")
-        client.loop_stop()
-        client.disconnect()
-    except Exception as e:
-        log.error(f"Error during MQTT shutdown: {e}")
+    log.info("Stopping worker thread and MQTT client...")
+    request_queue.put(SHUTDOWN_SENTINEL)
+
+    with active_responses_lock:
+        for conn in list(active_responses.values()):
+            try:
+                if conn.sock is not None:
+                    conn.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed/disconnected - nothing to unblock
+            conn.close()
+
+    worker_thread.join(timeout=SHUTDOWN_TIMEOUT)
+
+    if worker_thread.is_alive():
+        log.warning(
+            f"Worker thread did not finish within {SHUTDOWN_TIMEOUT}s "
+            "even after cancelling; proceeding with shutdown anyway - "
+            "the thread is a daemon and will be discarded on process exit."
+        )
+    else:
+        log.debug("Worker thread exited cleanly.")
+
+    client.loop_stop()
+    client.disconnect()
     log.info("Shutdown complete.")
