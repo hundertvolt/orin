@@ -32,7 +32,7 @@ parser.add_argument("--ollama-host", default="localhost", help="Ollama host addr
 parser.add_argument("--ollama-port", type=int, default="11434", help="Ollama host address (default: 11434)")
 parser.add_argument("--connect-timeout", type=float, default=5.0, help="Max seconds to establish Ollama TCP connection")
 parser.add_argument("--stream-timeout", type=float, default=120.0, help="Max seconds of silence between streamed chunks")
-parser.add_argument("--shutdown-timeout", type=float, default=5.0, help=("Max seconds to full service shutdown")
+parser.add_argument("--shutdown-timeout", type=float, default=5.0, help="Max seconds to full service shutdown")
 parser.add_argument("--loglevel", default="INFO", choices=logChoices, help="Logging level")
 args = parser.parse_args()
 
