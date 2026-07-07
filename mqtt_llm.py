@@ -388,7 +388,10 @@ finally:
                     conn.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass  # already closed/disconnected - nothing to unblock
-            conn.close()
+            try:
+                conn.close()
+            except OSError:
+                pass  # already closed/disconnected - nothing to clean up
 
     worker_thread.join(timeout=SHUTDOWN_TIMEOUT)
 
