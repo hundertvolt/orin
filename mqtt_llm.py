@@ -328,6 +328,7 @@ def ollama_worker() -> None:
 # ------------------------------
 
 client = mqtt.Client(client_id="orin_ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+client.max_queued_messages_set(5)
 client.will_set(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
 client.on_connect = on_connect
