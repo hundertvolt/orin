@@ -133,51 +133,62 @@ class GenerationCancelled(Exception):
 # ------------------------------
 
 def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code == 0:
-        sub_topic = f"{MQTT_TOPIC}/request"
-        log.info(f"Connected to MQTT broker, listening to '{sub_topic}'.")
-        cli.subscribe(sub_topic, qos=1)
-    else:
-        log.error(f"MQTT connection failed: {reason_code}")
+    # paho re-raises exceptions escaping this callback, which kills its network
+    # loop thread for good, so every path out of here must be caught locally.
+    try:
+        if reason_code == 0:
+            sub_topic = f"{MQTT_TOPIC}/request"
+            log.info(f"Connected to MQTT broker, listening to '{sub_topic}'.")
+            cli.subscribe(sub_topic, qos=1)
+        else:
+            log.error(f"MQTT connection failed: {reason_code}")
+    except Exception as e:
+        log.error(f"Unhandled error in on_connect: {e}")
 
 def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code != 0:
-        log.warning(f"Unexpected MQTT disconnection: {reason_code}")
-    else:
-        log.info("MQTT disconnected cleanly")
+    try:
+        if reason_code != 0:
+            log.warning(f"Unexpected MQTT disconnection: {reason_code}")
+        else:
+            log.info("MQTT disconnected cleanly")
+    except Exception as e:
+        log.error(f"Unhandled error in on_disconnect: {e}")
 
 def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
     try:
-        raw = msg.payload.decode("utf-8")
-    except Exception as e:
-        log.error(f"Failed to decode message payload: {e}")
-        return
+        try:
+            raw = msg.payload.decode("utf-8")
+        except Exception as e:
+            log.error(f"Failed to decode message payload: {e}")
+            return
 
-    log.info(f"Received message on {msg.topic}: {raw}")
+        log.info(f"Received message on {msg.topic}: {raw}")
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        handle_request_error(request_id=None, code=ErrorCode.INVALID_JSON, message=str(e))
-        return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            handle_request_error(request_id=None, code=ErrorCode.INVALID_JSON, message=str(e))
+            return
 
-    fallback_id = data.get("request_id") if isinstance(data, dict) else None
+        fallback_id = data.get("request_id") if isinstance(data, dict) else None
 
-    try:
-        request = OllamaRequest.model_validate(data)
-    except ValidationError as e:
-        handle_request_error(
-            request_id=fallback_id,
-            code=ErrorCode.VALIDATION_ERROR,
-            message=format_validation_error(e),
+        try:
+            request = OllamaRequest.model_validate(data)
+        except ValidationError as e:
+            handle_request_error(
+                request_id=fallback_id,
+                code=ErrorCode.VALIDATION_ERROR,
+                message=format_validation_error(e),
+            )
+            return
+
+        request_queue.put(request)
+        log.debug(
+            f"Queued request_id={request.request_id} "
+            f"(queue depth={request_queue.qsize()})"
         )
-        return
-
-    request_queue.put(request)
-    log.debug(
-        f"Queued request_id={request.request_id} "
-        f"(queue depth={request_queue.qsize()})"
-    )
+    except Exception as e:
+        log.error(f"Unhandled error in on_message: {e}")
 
 # ------------------------------
 # Ollama worker
@@ -254,7 +265,10 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
         finally:
             with active_responses_lock:
                 active_responses.pop(request.request_id, None)
-            conn.close()
+            try:
+                conn.close()
+            except OSError:
+                pass  # already closed/disconnected - nothing to clean up
 
     except Exception:  # catch all exceptions and explicitly classify for deliberate cancellation
         if shutdown_event.is_set():
@@ -383,6 +397,9 @@ finally:
     else:
         log.debug("Worker thread exited cleanly.")
 
-    client.loop_stop()
-    client.disconnect()
+    try:
+        client.loop_stop()
+        client.disconnect()
+    except Exception as e:
+        log.warning(f"Error while stopping MQTT client: {e}")
     log.info("Shutdown complete.")
