@@ -39,6 +39,7 @@ args = parser.parse_args()
 MQTT_BROKER: str = args.broker
 MQTT_PORT: int = args.port
 MQTT_TOPIC: str = args.topic
+MQTT_STATUS_TOPIC: str = f"{MQTT_TOPIC}/status"
 USERNAME: Optional[str] = args.username
 CRED_PATH = Path(args.credpath) if args.credpath else None
 OLLAMA_HOST: str = args.ollama_host
@@ -140,6 +141,7 @@ def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_co
             sub_topic = f"{MQTT_TOPIC}/request"
             log.info(f"Connected to MQTT broker, listening to '{sub_topic}'.")
             cli.subscribe(sub_topic, qos=1)
+            cli.publish(MQTT_STATUS_TOPIC, json.dumps({"status": "online"}), qos=1, retain=True)
         else:
             log.error(f"MQTT connection failed: {reason_code}")
     except Exception as e:
@@ -326,6 +328,7 @@ def ollama_worker() -> None:
 # ------------------------------
 
 client = mqtt.Client(client_id="orin_ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+client.will_set(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
 client.on_connect = on_connect
 client.on_disconnect = on_disconnect
@@ -398,6 +401,10 @@ finally:
         log.debug("Worker thread exited cleanly.")
 
     try:
+        if client.is_connected():
+            info = client.publish(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
+            info.wait_for_publish(timeout=2.0)  # ensure the offline status is sent before disconnecting
+            log.debug("Offline status published.")
         client.loop_stop()
         client.disconnect()
     except Exception as e:
