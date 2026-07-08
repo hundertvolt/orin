@@ -147,8 +147,9 @@ class ActiveGeneration:
     def sock(self) -> Optional[socket.socket]:
         return self._sock
 
-    def store_socket(self) -> None:
-        """Capture conn.sock now, before getresponse() can null it."""
+    def connect(self) -> None:
+        """Open the connection and capture its socket, before getresponse() can null it."""
+        self.conn.connect()
         self._sock = self.conn.sock
 
     def shutdown(self) -> None:
@@ -158,6 +159,12 @@ class ActiveGeneration:
                 self._sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass  # already closed/disconnected - nothing to unblock
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except OSError:
+            pass  # already closed/disconnected - nothing to clean up
 
 active_responses: Dict[str, ActiveGeneration] = {}
 
@@ -265,9 +272,8 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
 
     try:
         try:
-            conn.connect()
+            active_call.connect()
             conn.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
-            active_call.store_socket()
 
             conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
@@ -315,10 +321,7 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
         finally:
             with active_responses_lock:
                 active_responses.pop(request.request_id, None)
-            try:
-                conn.close()
-            except OSError:
-                pass  # already closed/disconnected - nothing to clean up
+            active_call.close()
 
     except Exception:  # catch all exceptions and explicitly classify for deliberate cancellation
         if shutdown_event.is_set():
@@ -432,10 +435,7 @@ finally:
     with active_responses_lock:
         for call in list(active_responses.values()):
             call.shutdown()
-            try:
-                call.conn.close()
-            except OSError:
-                pass  # already closed/disconnected - nothing to clean up
+            call.close()
 
     worker_thread.join(timeout=SHUTDOWN_TIMEOUT)
 
