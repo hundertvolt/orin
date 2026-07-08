@@ -39,6 +39,7 @@ args = parser.parse_args()
 MQTT_BROKER: str = args.broker
 MQTT_PORT: int = args.port
 MQTT_TOPIC: str = args.topic
+MQTT_STATUS_TOPIC: str = f"{MQTT_TOPIC}/status"
 USERNAME: Optional[str] = args.username
 CRED_PATH = Path(args.credpath) if args.credpath else None
 OLLAMA_HOST: str = args.ollama_host
@@ -122,8 +123,54 @@ def handle_request_error(request_id: Optional[str], code: ErrorCode, message: An
 request_queue: "queue.Queue[Any]" = queue.Queue()
 SHUTDOWN_SENTINEL = object()
 shutdown_event = threading.Event()
-active_responses: Dict[str, http.client.HTTPConnection] = {}
 active_responses_lock = threading.Lock()
+
+class ActiveGeneration:
+    """Tracks an in-flight Ollama call so shutdown can interrupt it.
+
+    http.client's getresponse() closes and nulls HTTPConnection.sock as
+    soon as it reads a response with no Content-Length (true for our
+    streamed NDJSON responses) - "passing" the live socket to the
+    response object instead. So conn.sock can't be relied on to reach
+    the connection once streaming has started. We capture the raw
+    socket reference right after connect(), before getresponse() can
+    null it, and shut that down directly - the underlying socket object
+    stays valid (only conn's reference to it is cleared) and its
+    shutdown() call still interrupts a thread blocked reading it.
+    """
+
+    def __init__(self, conn: http.client.HTTPConnection) -> None:
+        self._conn = conn
+        self._sock: Optional[socket.socket] = None
+
+    @property
+    def conn(self) -> http.client.HTTPConnection:
+        return self._conn
+
+    @property
+    def sock(self) -> Optional[socket.socket]:
+        return self._sock
+
+    def connect(self) -> None:
+        """Open the connection and capture its socket, before getresponse() can null it."""
+        self._conn.connect()
+        self._sock = self._conn.sock
+
+    def shutdown(self) -> None:
+        """Interrupt a thread blocked reading the captured socket, if any."""
+        if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed/disconnected - nothing to unblock
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except OSError:
+            pass  # already closed/disconnected - nothing to clean up
+
+active_responses: Dict[str, ActiveGeneration] = {}
 
 class GenerationCancelled(Exception):
     """Raised when an in-flight Ollama generation is aborted due to shutdown."""
@@ -133,51 +180,63 @@ class GenerationCancelled(Exception):
 # ------------------------------
 
 def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code == 0:
-        sub_topic = f"{MQTT_TOPIC}/request"
-        log.info(f"Connected to MQTT broker, listening to '{sub_topic}'.")
-        cli.subscribe(sub_topic, qos=1)
-    else:
-        log.error(f"MQTT connection failed: {reason_code}")
+    # paho re-raises exceptions escaping this callback, which kills its network
+    # loop thread for good, so every path out of here must be caught locally.
+    try:
+        if reason_code == 0:
+            sub_topic = f"{MQTT_TOPIC}/request"
+            log.info(f"Connected to MQTT broker, listening to '{sub_topic}'.")
+            cli.subscribe(sub_topic, qos=1)
+            cli.publish(MQTT_STATUS_TOPIC, json.dumps({"status": "online"}), qos=1, retain=True)
+        else:
+            log.error(f"MQTT connection failed: {reason_code}")
+    except Exception as e:
+        log.error(f"Unhandled error in on_connect: {e}")
 
 def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code != 0:
-        log.warning(f"Unexpected MQTT disconnection: {reason_code}")
-    else:
-        log.info("MQTT disconnected cleanly")
+    try:
+        if reason_code != 0:
+            log.warning(f"Unexpected MQTT disconnection: {reason_code}")
+        else:
+            log.info("MQTT disconnected cleanly")
+    except Exception as e:
+        log.error(f"Unhandled error in on_disconnect: {e}")
 
 def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
     try:
-        raw = msg.payload.decode("utf-8")
-    except Exception as e:
-        log.error(f"Failed to decode message payload: {e}")
-        return
+        try:
+            raw = msg.payload.decode("utf-8")
+        except Exception as e:
+            log.error(f"Failed to decode message payload: {e}")
+            return
 
-    log.info(f"Received message on {msg.topic}: {raw}")
+        log.info(f"Received message on {msg.topic}: {raw}")
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        handle_request_error(request_id=None, code=ErrorCode.INVALID_JSON, message=str(e))
-        return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            handle_request_error(request_id=None, code=ErrorCode.INVALID_JSON, message=str(e))
+            return
 
-    fallback_id = data.get("request_id") if isinstance(data, dict) else None
+        fallback_id = data.get("request_id") if isinstance(data, dict) else None
 
-    try:
-        request = OllamaRequest.model_validate(data)
-    except ValidationError as e:
-        handle_request_error(
-            request_id=fallback_id,
-            code=ErrorCode.VALIDATION_ERROR,
-            message=format_validation_error(e),
+        try:
+            request = OllamaRequest.model_validate(data)
+        except ValidationError as e:
+            handle_request_error(
+                request_id=fallback_id,
+                code=ErrorCode.VALIDATION_ERROR,
+                message=format_validation_error(e),
+            )
+            return
+
+        request_queue.put(request)
+        log.debug(
+            f"Queued request_id={request.request_id} "
+            f"(queue depth={request_queue.qsize()})"
         )
-        return
-
-    request_queue.put(request)
-    log.debug(
-        f"Queued request_id={request.request_id} "
-        f"(queue depth={request_queue.qsize()})"
-    )
+    except Exception as e:
+        log.error(f"Unhandled error in on_message: {e}")
 
 # ------------------------------
 # Ollama worker
@@ -210,22 +269,24 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
     chunk_count = 0
 
     conn = http.client.HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=OLLAMA_CONNECT_TIMEOUT)
+    active_call = ActiveGeneration(conn)
 
     with active_responses_lock:
-        active_responses[request.request_id] = conn
+        active_responses[request.request_id] = active_call
 
     try:
         try:
-            conn.connect()
-            conn.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
+            active_call.connect()
+            active_call.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
 
-            conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
-            resp = conn.getresponse()
+            active_call.conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
+            resp = active_call.conn.getresponse()
 
             if resp.status != 200:
                 error_body = resp.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"Ollama returned HTTP {resp.status}: {error_body}")
 
+            stream_completed = False
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line:
@@ -250,11 +311,21 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
 
                 if chunk.get("done"):
                     final_meta = chunk
+                    stream_completed = True
                     break
+
+            if not stream_completed:
+                # The connection ended (closed/reset/EOF) before Ollama sent a
+                # final "done" chunk - the caller must not mistake this
+                # truncated output for a complete response.
+                raise RuntimeError(
+                    f"Ollama stream ended unexpectedly after {chunk_count} chunk(s) "
+                    "without a final 'done' marker"
+                )
         finally:
             with active_responses_lock:
                 active_responses.pop(request.request_id, None)
-            conn.close()
+            active_call.close()
 
     except Exception:  # catch all exceptions and explicitly classify for deliberate cancellation
         if shutdown_event.is_set():
@@ -312,6 +383,8 @@ def ollama_worker() -> None:
 # ------------------------------
 
 client = mqtt.Client(client_id="orin_ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+client.max_queued_messages_set(5)
+client.will_set(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
 client.on_connect = on_connect
 client.on_disconnect = on_disconnect
@@ -364,13 +437,9 @@ finally:
     request_queue.put(SHUTDOWN_SENTINEL)
 
     with active_responses_lock:
-        for conn in list(active_responses.values()):
-            try:
-                if conn.sock is not None:
-                    conn.sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass  # already closed/disconnected - nothing to unblock
-            conn.close()
+        for call in list(active_responses.values()):
+            call.shutdown()
+            call.close()
 
     worker_thread.join(timeout=SHUTDOWN_TIMEOUT)
 
@@ -383,6 +452,13 @@ finally:
     else:
         log.debug("Worker thread exited cleanly.")
 
-    client.loop_stop()
-    client.disconnect()
+    try:
+        if client.is_connected():
+            info = client.publish(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
+            info.wait_for_publish(timeout=2.0)  # ensure the offline status is sent before disconnecting
+            log.debug("Offline status published.")
+        client.loop_stop()
+        client.disconnect()
+    except Exception as e:
+        log.warning(f"Error while stopping MQTT client: {e}")
     log.info("Shutdown complete.")
