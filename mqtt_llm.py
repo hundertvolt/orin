@@ -140,8 +140,12 @@ class ActiveGeneration:
     """
 
     def __init__(self, conn: http.client.HTTPConnection) -> None:
-        self.conn = conn
+        self._conn = conn
         self._sock: Optional[socket.socket] = None
+
+    @property
+    def conn(self) -> http.client.HTTPConnection:
+        return self._conn
 
     @property
     def sock(self) -> Optional[socket.socket]:
@@ -149,8 +153,8 @@ class ActiveGeneration:
 
     def connect(self) -> None:
         """Open the connection and capture its socket, before getresponse() can null it."""
-        self.conn.connect()
-        self._sock = self.conn.sock
+        self._conn.connect()
+        self._sock = self._conn.sock
 
     def shutdown(self) -> None:
         """Interrupt a thread blocked reading the captured socket, if any."""
@@ -162,7 +166,7 @@ class ActiveGeneration:
 
     def close(self) -> None:
         try:
-            self.conn.close()
+            self._conn.close()
         except OSError:
             pass  # already closed/disconnected - nothing to clean up
 
@@ -273,10 +277,10 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
     try:
         try:
             active_call.connect()
-            conn.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
+            active_call.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
 
-            conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
-            resp = conn.getresponse()
+            active_call.conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
+            resp = active_call.conn.getresponse()
 
             if resp.status != 200:
                 error_body = resp.read().decode("utf-8", errors="replace")
