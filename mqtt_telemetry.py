@@ -50,16 +50,24 @@ log = logging.getLogger("orin_mqtt")
 # ------------------------------
 
 def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code == 0:
-        log.info("Connected to MQTT broker")
-    else:
-        log.error(f"MQTT connection failed: {reason_code}")
+    # paho re-raises exceptions escaping this callback, which kills its network
+    # loop thread for good, so every path out of here must be caught locally.
+    try:
+        if reason_code == 0:
+            log.info("Connected to MQTT broker")
+        else:
+            log.error(f"MQTT connection failed: {reason_code}")
+    except Exception as e:
+        log.error(f"Unhandled error in on_connect: {e}")
 
 def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code != 0:
-        log.warning(f"Unexpected MQTT disconnection: {reason_code}")
-    else:
-        log.info("MQTT disconnected cleanly")
+    try:
+        if reason_code != 0:
+            log.warning(f"Unexpected MQTT disconnection: {reason_code}")
+        else:
+            log.info("MQTT disconnected cleanly")
+    except Exception as e:
+        log.error(f"Unhandled error in on_disconnect: {e}")
 
 client = mqtt.Client(client_id="orin_nano", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.max_queued_messages_set(5)
@@ -159,6 +167,7 @@ except SystemExit:
 
 except Exception as e:
     log.error(f"Error in main loop: {e}")
+    raise  # let systemd restart
 
 finally:
     log.info("Stopping MQTT loop and disconnecting...")
