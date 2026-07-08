@@ -209,11 +209,12 @@ def test_active_generation_sock_survives_getresponse_and_unblocks_read(loaded_mo
     http.client's getresponse() nulls conn.sock right after reading
     headers for our NDJSON responses (no Content-Length), "passing" the
     live socket to the response object instead - proven by
-    active_responses[id].conn.sock being None below. The fix is to
-    capture the raw socket into ActiveGeneration.sock right after
-    connect(), before getresponse() can null conn.sock. That captured
-    reference must still be genuinely usable to shut down the
-    connection and unblock a thread mid-read - not just non-None.
+    active_responses[id].conn.sock being None below. The fix is
+    ActiveGeneration.store_socket(), called right after connect() before
+    getresponse() can null conn.sock. That captured reference must still
+    be genuinely usable via ActiveGeneration.shutdown() - the same call
+    the production shutdown block makes - to interrupt a thread mid-read,
+    not just be non-None.
     """
     m = loaded_module
     fake_ollama.scenario = "hang"
@@ -250,11 +251,11 @@ def test_active_generation_sock_survives_getresponse_and_unblocks_read(loaded_mo
         # This is exactly what the production shutdown block does.
         m.shutdown_event.set()
         start = time.monotonic()
-        call.sock.shutdown(socket.SHUT_RDWR)
+        call.shutdown()
         t.join(timeout=5)
         elapsed = time.monotonic() - start
 
-        assert not t.is_alive(), "shutdown() on the captured socket did not unblock the read"
+        assert not t.is_alive(), "ActiveGeneration.shutdown() did not unblock the read"
         assert elapsed < 2, f"unblock took {elapsed:.2f}s, expected near-instant"
         assert isinstance(result_holder.get("error"), m.GenerationCancelled), (
             f"expected GenerationCancelled, got {result_holder}"

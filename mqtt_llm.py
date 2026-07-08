@@ -141,7 +141,23 @@ class ActiveGeneration:
 
     def __init__(self, conn: http.client.HTTPConnection) -> None:
         self.conn = conn
-        self.sock: Optional[socket.socket] = None
+        self._sock: Optional[socket.socket] = None
+
+    @property
+    def sock(self) -> Optional[socket.socket]:
+        return self._sock
+
+    def store_socket(self) -> None:
+        """Capture conn.sock now, before getresponse() can null it."""
+        self._sock = self.conn.sock
+
+    def shutdown(self) -> None:
+        """Interrupt a thread blocked reading the captured socket, if any."""
+        if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed/disconnected - nothing to unblock
 
 active_responses: Dict[str, ActiveGeneration] = {}
 
@@ -251,7 +267,7 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
         try:
             conn.connect()
             conn.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
-            active_call.sock = conn.sock  # capture before getresponse() can null conn.sock
+            active_call.store_socket()
 
             conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
@@ -415,11 +431,7 @@ finally:
 
     with active_responses_lock:
         for call in list(active_responses.values()):
-            try:
-                if call.sock is not None:
-                    call.sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass  # already closed/disconnected - nothing to unblock
+            call.shutdown()
             try:
                 call.conn.close()
             except OSError:
