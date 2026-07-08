@@ -378,6 +378,16 @@ def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fa
     jtop given here) and then run its own shutdown/cleanup code, exactly
     like a real SIGTERM would.
 
+    Since connect()/loop_start() are stubbed, on_connect() never fires
+    naturally, so connected_event (which the script waits on, bounded,
+    right after loop_start() - see mqtt_telemetry.py for why) would
+    never get set(). threading.Event.wait is patched to return
+    immediately (no other code here starts real threads during this
+    call, so this doesn't hit the Thread-internals hazard that ruled
+    out the same trick for shutdown_event in load_mqtt_llm()). This
+    only unblocks the wait - it has no effect on what is_connected()
+    reports, which client_method_mocks controls separately.
+
     If jtop_enter_error is given, jtop().__enter__() raises it instead;
     the module's own `except Exception: raise` then lets it propagate
     out of this function for real (this function re-raises it), so
@@ -403,6 +413,7 @@ def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fa
         with patch.object(sys, "argv", ["mqtt_telemetry.py", *argv]), \
              patch("signal.signal"), \
              patch("time.sleep", side_effect=fake_sleep), \
+             patch("threading.Event.wait", return_value=True), \
              _patched_client_methods(mocks):
             try:
                 spec.loader.exec_module(module)

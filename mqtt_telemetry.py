@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import signal
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -49,6 +50,10 @@ log = logging.getLogger("orin_mqtt")
 # MQTT setup
 # ------------------------------
 
+CONNECT_SETTLE_TIMEOUT = 5.0  # bounded wait for the initial CONNACK, see below
+
+connected_event = threading.Event()
+
 def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
     # paho re-raises exceptions escaping this callback, which kills its network
     # loop thread for good, so every path out of here must be caught locally.
@@ -59,6 +64,8 @@ def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_co
             log.error(f"MQTT connection failed: {reason_code}")
     except Exception as e:
         log.error(f"Unhandled error in on_connect: {e}")
+    finally:
+        connected_event.set()
 
 def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
     try:
@@ -96,6 +103,22 @@ except Exception as e:
     raise  # let systemd restart
 
 client.loop_start()  # background loop handles reconnects
+
+# client.connect() only sends the CONNECT packet; the CONNACK that actually
+# flips is_connected() to True is processed asynchronously by the loop
+# thread just started above. Without waiting for it here, a fast-failing
+# jtop() below could lose the race against that callback: is_connected()
+# would read False when the shutdown path checks it (skipping the offline
+# publish), while the CONNACK arrives moments later and lets the eventual
+# disconnect() go out clean - which cancels LWT delivery too. Net result:
+# no offline announcement at all. Waiting (bounded) for the connection to
+# settle before ever attempting jtop() closes that race: from here on,
+# is_connected() reflects a state that isn't still in flight.
+if not connected_event.wait(timeout=CONNECT_SETTLE_TIMEOUT):
+    log.warning(
+        f"No MQTT CONNACK within {CONNECT_SETTLE_TIMEOUT}s; proceeding anyway "
+        "(the background loop keeps retrying)."
+    )
 
 # ------------------------------
 # Telemetry publishing
