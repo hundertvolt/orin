@@ -21,18 +21,30 @@ from pydantic import BaseModel, Field, ValidationError
 # Command-line arguments
 # ------------------------------
 
+def _port_type(value: str) -> int:
+    ivalue = int(value)
+    if not (1 <= ivalue <= 65535):
+        raise argparse.ArgumentTypeError(f"must be between 1 and 65535, got {ivalue}")
+    return ivalue
+
+def _positive_float(value: str) -> float:
+    fvalue = float(value)
+    if fvalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {fvalue}")
+    return fvalue
+
 logChoices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 parser = argparse.ArgumentParser(description="MQTT interface to Ollama")
 parser.add_argument("--broker", required=True, help="MQTT broker IP or hostname")
-parser.add_argument("--port", type=int, default=1883, help="MQTT broker port (default 1883)")
+parser.add_argument("--port", type=_port_type, default=1883, help="MQTT broker port (default 1883)")
 parser.add_argument("--username", help="MQTT username")
 parser.add_argument("--credpath", help="LoadCredential path for MQTT password")
 parser.add_argument("--topic", default="orin/ollama", help="MQTT topic to publish and receive")
 parser.add_argument("--ollama-host", default="localhost", help="Ollama host address (default: localhost)")
-parser.add_argument("--ollama-port", type=int, default="11434", help="Ollama host address (default: 11434)")
-parser.add_argument("--connect-timeout", type=float, default=5.0, help="Max seconds to establish Ollama TCP connection")
-parser.add_argument("--stream-timeout", type=float, default=120.0, help="Max seconds of silence between streamed chunks")
-parser.add_argument("--shutdown-timeout", type=float, default=5.0, help="Max seconds to full service shutdown")
+parser.add_argument("--ollama-port", type=_port_type, default="11434", help="Ollama host address (default: 11434)")
+parser.add_argument("--connect-timeout", type=_positive_float, default=5.0, help="Max seconds to establish Ollama TCP connection")
+parser.add_argument("--stream-timeout", type=_positive_float, default=120.0, help="Max seconds of silence between streamed chunks")
+parser.add_argument("--shutdown-timeout", type=_positive_float, default=5.0, help="Max seconds to full service shutdown")
 parser.add_argument("--loglevel", default="INFO", choices=logChoices, help="Logging level")
 args = parser.parse_args()
 
@@ -123,6 +135,8 @@ def handle_request_error(request_id: Optional[str], code: ErrorCode, message: An
 request_queue: "queue.Queue[Any]" = queue.Queue()
 SHUTDOWN_SENTINEL = object()
 shutdown_event = threading.Event()
+connected_event = threading.Event()
+CONNECT_RETRY_LOG_INTERVAL = 5.0  # how often to log while waiting for the initial connection
 active_responses_lock = threading.Lock()
 
 class ActiveGeneration:
@@ -192,6 +206,8 @@ def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_co
             log.error(f"MQTT connection failed: {reason_code}")
     except Exception as e:
         log.error(f"Unhandled error in on_connect: {e}")
+    finally:
+        connected_event.set()
 
 def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
     try:
@@ -201,6 +217,31 @@ def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason
             log.info("MQTT disconnected cleanly")
     except Exception as e:
         log.error(f"Unhandled error in on_disconnect: {e}")
+
+def wait_for_mqtt_connection() -> None:
+    """Block until the MQTT client is genuinely connected, or shutdown
+    is requested.
+
+    client.connect() only sends the CONNECT packet; the CONNACK that
+    flips is_connected() to True is processed asynchronously by the
+    loop thread. Without waiting for it here, a shutdown signal arriving
+    before that CONNACK lands could race the shutdown block's
+    is_connected() check: it could read False (skipping the explicit
+    offline publish) while the CONNACK then lands moments later and lets
+    the eventual disconnect() go out clean - which cancels LWT delivery
+    too. Net effect: no offline announcement at all. handle_exit() also
+    sets connected_event, so a shutdown request wakes this promptly
+    instead of waiting out the full log interval.
+    """
+    while not client.is_connected() and not shutdown_event.is_set():
+        connected_event.clear()
+        if client.is_connected() or shutdown_event.is_set():
+            continue  # settled in the instant between the check above and clear()
+        if not connected_event.wait(timeout=CONNECT_RETRY_LOG_INTERVAL):
+            log.warning(
+                f"Still waiting for MQTT connection after {CONNECT_RETRY_LOG_INTERVAL}s; "
+                "retrying in the background..."
+            )
 
 def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
     try:
@@ -272,6 +313,12 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
     active_call = ActiveGeneration(conn)
 
     with active_responses_lock:
+        # Checked under the same lock the shutdown block uses to snapshot
+        # and interrupt active_responses, so there's no window where a
+        # request dequeued just as shutdown begins could register after
+        # that snapshot was taken and run uninterrupted to completion.
+        if shutdown_event.is_set():
+            raise GenerationCancelled()
         active_responses[request.request_id] = active_call
 
     try:
@@ -292,6 +339,11 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
                 if not line:
                     continue
                 chunk = json.loads(line)
+                if not isinstance(chunk, dict):
+                    # Guards chunk.get(...)/final_meta.items() below - a
+                    # non-object line is a protocol violation, not
+                    # something to fail on with a raw AttributeError.
+                    raise RuntimeError(f"Ollama sent a non-object chunk: {chunk!r}")
                 chunk_count += 1
 
                 if chunk.get("response"):
@@ -409,13 +461,11 @@ except Exception as e:
     log.error(f"Initial MQTT connect failed: {e}")
     raise  # let systemd restart
 
-client.loop_start()  # background thread handles the network loop and reconnects
-
-# ------------------------------
-# Worker thread startup
-# ------------------------------
-worker_thread = threading.Thread(target=ollama_worker, name="ollama-worker", daemon=True)
-worker_thread.start()  # running as daemon makes OS cancel the thread as last resort on timeout
+try:
+    client.loop_start()  # background thread handles the network loop and reconnects
+except Exception as e:
+    log.error(f"Failed to start MQTT network loop: {e}")
+    raise  # let systemd restart
 
 # ------------------------------
 # Shutdown handling
@@ -424,9 +474,25 @@ worker_thread.start()  # running as daemon makes OS cancel the thread as last re
 def handle_exit(signum: int, frame: Optional[Any]) -> None:
     log.info(f"Received signal {signum}, shutting down...")
     shutdown_event.set()
+    connected_event.set()  # wake wait_for_mqtt_connection() promptly too, if it's blocked there
 
+# Registered here, before wait_for_mqtt_connection() is ever called, so a
+# signal arriving while still waiting for the initial connection can
+# interrupt that wait too, not just the final shutdown_event.wait() below.
 signal.signal(signal.SIGTERM, handle_exit)
 signal.signal(signal.SIGINT, handle_exit)
+
+wait_for_mqtt_connection()
+
+# ------------------------------
+# Worker thread startup
+# ------------------------------
+worker_thread = threading.Thread(target=ollama_worker, name="ollama-worker", daemon=True)
+try:
+    worker_thread.start()  # running as daemon makes OS cancel the thread as last resort on timeout
+except Exception as e:
+    log.error(f"Failed to start worker thread: {e}")
+    raise  # let systemd restart
 
 log.info(f"Ollama MQTT bridge started, listening on '{MQTT_TOPIC}/request'.")
 

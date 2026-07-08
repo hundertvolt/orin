@@ -16,14 +16,29 @@ from typing import Any, Dict, Optional
 # Command-line arguments
 # ------------------------------
 
+def _port_type(value: str) -> int:
+    ivalue = int(value)
+    if not (1 <= ivalue <= 65535):
+        raise argparse.ArgumentTypeError(f"must be between 1 and 65535, got {ivalue}")
+    return ivalue
+
+def _positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        # time.sleep() raises ValueError for a negative interval, which
+        # would otherwise surface as a crash loop instead of a clear,
+        # immediate startup rejection.
+        raise argparse.ArgumentTypeError(f"must be positive, got {ivalue}")
+    return ivalue
+
 logChoices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 parser = argparse.ArgumentParser(description="Orin Nano telemetry to MQTT")
 parser.add_argument("--broker", required=True, help="MQTT broker IP or hostname")
-parser.add_argument("--port", type=int, default=1883, help="MQTT broker port (default 1883)")
+parser.add_argument("--port", type=_port_type, default=1883, help="MQTT broker port (default 1883)")
 parser.add_argument("--username", help="MQTT username")
 parser.add_argument("--credpath", help="LoadCredential path for MQTT password")
 parser.add_argument("--topic", default="orin/status", help="MQTT topic to publish telemetry")
-parser.add_argument("--interval", type=int, default=10, help="Publish interval in seconds")
+parser.add_argument("--interval", type=_positive_int, default=10, help="Publish interval in seconds")
 parser.add_argument("--loglevel", default="INFO", choices=logChoices, help="Logging level")
 
 args = parser.parse_args()
@@ -97,6 +112,8 @@ def wait_for_mqtt_connection() -> None:
     """
     while not client.is_connected():
         connected_event.clear()
+        if client.is_connected():
+            continue  # connected in the instant between the check above and clear()
         if not connected_event.wait(timeout=CONNECT_RETRY_LOG_INTERVAL):
             log.warning(
                 f"Still waiting for MQTT connection after {CONNECT_RETRY_LOG_INTERVAL}s; "
@@ -129,7 +146,11 @@ except Exception as e:
     log.error(f"Initial MQTT connect failed: {e}")
     raise  # let systemd restart
 
-client.loop_start()  # background loop handles reconnects
+try:
+    client.loop_start()  # background loop handles reconnects
+except Exception as e:
+    log.error(f"Failed to start MQTT network loop: {e}")
+    raise  # let systemd restart
 
 def handle_exit(signum: int, frame: Optional[Any]) -> None:
     log.info(f"Received signal {signum}, shutting down...")

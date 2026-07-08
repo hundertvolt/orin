@@ -374,3 +374,67 @@ def _port_open(port):
             return True
     except OSError:
         return False
+
+
+def test_signal_interrupts_indefinite_connect_wait_and_shuts_down_cleanly():
+    """Regression test, end to end, for the connect-settle gating fix:
+    point at a listener that accepts the TCP connection but never sends a
+    CONNACK (no MQTT broker at all, just a raw socket held open), so the
+    connection genuinely never settles. wait_for_mqtt_connection() must
+    log the periodic warning for real (proving it's actually blocked,
+    not connected) and a SIGTERM must still interrupt the indefinite
+    wait cleanly - proving it isn't a silent, unbreakable hang.
+
+    Unlike mqtt_telemetry.py (where handle_exit() raises SystemExit
+    directly, aborting before jtop() is ever reached),
+    handle_exit() here only sets events: wait_for_mqtt_connection()
+    unblocks the same way for "connected" or "shutdown requested", and
+    the worker thread does still start afterwards - it just immediately
+    receives the shutdown sentinel and exits. That's harmless by design,
+    so the assertions here are about a clean, bounded shutdown, not
+    about the worker thread never starting.
+    """
+    port = free_port()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+
+    def accept_and_hold():
+        try:
+            conn, _ = srv.accept()
+            conn.settimeout(30)
+            try:
+                conn.recv(1)  # blocks until the client closes or we time out
+            except OSError:
+                pass
+        except OSError:
+            pass  # srv.close() below unblocks a pending accept()
+
+    holder = threading.Thread(target=accept_and_hold, daemon=True)
+    holder.start()
+
+    proc = subprocess.Popen(
+        [sys.executable, str(MODULE_PATH),
+         "--broker", "127.0.0.1", "--port", str(port), "--topic", "orin/ollama",
+         "--ollama-host", "127.0.0.1", "--ollama-port", str(free_port()),
+         "--loglevel", "DEBUG", "--shutdown-timeout", "5"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    svc = ServiceProcess(proc)
+    try:
+        assert svc.wait_for_log("Still waiting for MQTT connection", timeout=8), svc.text()
+
+        start = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=10)
+        elapsed = time.monotonic() - start
+
+        assert rc == 0, "SIGTERM should still interrupt an indefinite connection wait: " + svc.text()
+        assert elapsed < 8, f"shutdown took {elapsed:.1f}s, longer than --shutdown-timeout allows"
+        assert "Shutdown complete." in svc.text()
+        assert "Worker thread did not finish within" not in svc.text()
+    finally:
+        svc.stop()
+        srv.close()
+        holder.join(timeout=2)
