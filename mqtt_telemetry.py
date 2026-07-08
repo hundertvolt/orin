@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import signal
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -49,17 +50,58 @@ log = logging.getLogger("orin_mqtt")
 # MQTT setup
 # ------------------------------
 
+CONNECT_RETRY_LOG_INTERVAL = 5.0  # how often to log while waiting for a connection
+
+connected_event = threading.Event()
+
 def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code == 0:
-        log.info("Connected to MQTT broker")
-    else:
-        log.error(f"MQTT connection failed: {reason_code}")
+    # paho re-raises exceptions escaping this callback, which kills its network
+    # loop thread for good, so every path out of here must be caught locally.
+    try:
+        if reason_code == 0:
+            log.info("Connected to MQTT broker")
+        else:
+            log.error(f"MQTT connection failed: {reason_code}")
+    except Exception as e:
+        log.error(f"Unhandled error in on_connect: {e}")
+    finally:
+        connected_event.set()
 
 def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
-    if reason_code != 0:
-        log.warning(f"Unexpected MQTT disconnection: {reason_code}")
-    else:
-        log.info("MQTT disconnected cleanly")
+    try:
+        if reason_code != 0:
+            log.warning(f"Unexpected MQTT disconnection: {reason_code}")
+        else:
+            log.info("MQTT disconnected cleanly")
+    except Exception as e:
+        log.error(f"Unhandled error in on_disconnect: {e}")
+
+def wait_for_mqtt_connection() -> None:
+    """Block until the MQTT client is genuinely connected.
+
+    jtop() must never be started while disconnected: client.connect()
+    only sends the CONNECT packet, and the CONNACK that actually flips
+    is_connected() to True is processed asynchronously by the loop
+    thread. Proceeding to jtop() without waiting for that risks a race
+    where a fast jtop() failure checks is_connected() before the CONNACK
+    lands, skipping the shutdown path's offline publish - and by the
+    time the connection does settle moments later, the resulting
+    disconnect() looks clean, which cancels LWT delivery too. Net
+    effect: no offline announcement at all.
+
+    paho's own reconnect_delay_set backoff is already retrying in the
+    background regardless; this just waits for it to succeed (or for a
+    shutdown signal to interrupt the wait), logging periodically so a
+    persistent outage stays visible instead of being silently retried
+    forever.
+    """
+    while not client.is_connected():
+        connected_event.clear()
+        if not connected_event.wait(timeout=CONNECT_RETRY_LOG_INTERVAL):
+            log.warning(
+                f"Still waiting for MQTT connection after {CONNECT_RETRY_LOG_INTERVAL}s; "
+                "retrying in the background..."
+            )
 
 client = mqtt.Client(client_id="orin_nano", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.max_queued_messages_set(5)
@@ -88,6 +130,16 @@ except Exception as e:
     raise  # let systemd restart
 
 client.loop_start()  # background loop handles reconnects
+
+def handle_exit(signum: int, frame: Optional[Any]) -> None:
+    log.info(f"Received signal {signum}, shutting down...")
+    raise SystemExit
+
+# Registered here, before wait_for_mqtt_connection() is ever called, so a
+# signal arriving while still waiting for the initial connection can
+# interrupt that wait too, not just the publish loop below.
+signal.signal(signal.SIGTERM, handle_exit)
+signal.signal(signal.SIGINT, handle_exit)
 
 # ------------------------------
 # Telemetry publishing
@@ -136,18 +188,12 @@ def publish_telemetry(jetson: jtop) -> None:
         log.error(f"Telemetry publish error: {e}")
 
 
-def handle_exit(signum: int, frame: Optional[Any]) -> None:
-    log.info(f"Received signal {signum}, shutting down...")
-    raise SystemExit
-
-signal.signal(signal.SIGTERM, handle_exit)
-signal.signal(signal.SIGINT, handle_exit)
-
 # ------------------------------
 # Main loop using jtop
 # ------------------------------
 
 try:
+    wait_for_mqtt_connection()
     with jtop() as jetsonTop:
         log.info(f"Telemetry service started using topic: {MQTT_TOPIC}.")
         while True:
@@ -159,6 +205,7 @@ except SystemExit:
 
 except Exception as e:
     log.error(f"Error in main loop: {e}")
+    raise  # let systemd restart
 
 finally:
     log.info("Stopping MQTT loop and disconnecting...")
