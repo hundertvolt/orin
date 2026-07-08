@@ -193,7 +193,13 @@ class GenerationCancelled(Exception):
 # MQTT setup
 # ------------------------------
 
-def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
+def on_connect(
+    cli: mqtt.Client,
+    userdata: Any,
+    flags: mqtt.ConnectFlags,
+    reason_code: mqtt.ReasonCode,
+    properties: Optional[mqtt.Properties],
+) -> None:
     # paho re-raises exceptions escaping this callback, which kills its network
     # loop thread for good, so every path out of here must be caught locally.
     try:
@@ -209,7 +215,13 @@ def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_co
     finally:
         connected_event.set()
 
-def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
+def on_disconnect(
+    cli: mqtt.Client,
+    userdata: Any,
+    flags: mqtt.DisconnectFlags,
+    reason_code: mqtt.ReasonCode,
+    properties: Optional[mqtt.Properties],
+) -> None:
     try:
         if reason_code != 0:
             log.warning(f"Unexpected MQTT disconnection: {reason_code}")
@@ -324,6 +336,7 @@ def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
     try:
         try:
             active_call.connect()
+            assert active_call.sock is not None, "conn.connect() succeeded without setting a socket"
             active_call.sock.settimeout(OLLAMA_STREAM_IDLE_TIMEOUT)  # switch to idle timeout once connected
 
             active_call.conn.request("POST", OLLAMA_PATH, body=body, headers={"Content-Type": "application/json"})

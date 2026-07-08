@@ -69,7 +69,13 @@ CONNECT_RETRY_LOG_INTERVAL = 5.0  # how often to log while waiting for a connect
 
 connected_event = threading.Event()
 
-def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
+def on_connect(
+    cli: mqtt.Client,
+    userdata: Any,
+    flags: mqtt.ConnectFlags,
+    reason_code: mqtt.ReasonCode,
+    properties: Optional[mqtt.Properties],
+) -> None:
     # paho re-raises exceptions escaping this callback, which kills its network
     # loop thread for good, so every path out of here must be caught locally.
     try:
@@ -82,7 +88,13 @@ def on_connect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_co
     finally:
         connected_event.set()
 
-def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason_code: int, properties: Any) -> None:
+def on_disconnect(
+    cli: mqtt.Client,
+    userdata: Any,
+    flags: mqtt.DisconnectFlags,
+    reason_code: mqtt.ReasonCode,
+    properties: Optional[mqtt.Properties],
+) -> None:
     try:
         if reason_code != 0:
             log.warning(f"Unexpected MQTT disconnection: {reason_code}")
