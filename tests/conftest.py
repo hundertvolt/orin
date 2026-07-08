@@ -1,30 +1,33 @@
 """
-Shared fixtures for the mqtt_llm.py test suite.
+Shared fixtures for the mqtt_llm.py and mqtt_telemetry.py test suites.
 
-mqtt_llm.py is a script, not a package: nearly everything (argument
-parsing, MQTT connect, the final shutdown_event.wait()) runs at import
-time, in an unguarded module body. To unit-test the functions inside it
-without hitting a real broker or blocking forever, `load_mqtt_llm()`
-loads a fresh copy of the module per call with:
+Both are scripts, not packages: nearly everything (argument parsing,
+MQTT connect, the main loop) runs at import time, in an unguarded
+module body. To unit-test the functions inside them without hitting a
+real broker or blocking forever, `load_mqtt_llm()` / `load_mqtt_telemetry()`
+load a fresh copy of the module per call with:
 
   - sys.argv patched to safe test arguments
   - mqtt.Client.connect / loop_start stubbed to no-ops (no real socket)
-  - threading.Event.wait patched to return immediately (so the
-    `shutdown_event.wait()` at the bottom of the script doesn't block
-    the import forever, and the shutdown/cleanup code at the bottom
-    runs once, synchronously, as part of loading)
+  - signal.signal() stubbed (only works on the main thread; exec_module()
+    runs on a background thread here)
+  - a module-specific trick to unblock whatever the script blocks on at
+    the end of its main body (see each loader's docstring)
 
 Each call produces an independent module object (unique sys.modules
-key, popped again immediately) so tests don't leak global state
-(request_queue, active_responses, shutdown_event) into each other.
+key, popped again immediately) so tests don't leak global state into
+each other.
 
 For the parts that are impractical or unsafe to mock convincingly
 (paho's real network loop, a real MQTT broker, an HTTP server speaking
-Ollama's streaming protocol), we run the real thing locally: a real
-Mosquitto broker as a subprocess, and a small stdlib HTTP server that
-mimics Ollama's /api/generate NDJSON streaming format.
+Ollama's streaming protocol, the jetson-stats service), we run the real
+thing locally where practical: a real Mosquitto broker as a subprocess,
+a small stdlib HTTP server that mimics Ollama's /api/generate NDJSON
+streaming format, and a minimal fake `jtop` package (real jetson-stats
+needs actual Jetson hardware and isn't installable here).
 """
 import contextlib
+import datetime
 import importlib.util
 import itertools
 import json
@@ -33,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -43,8 +47,11 @@ import paho.mqtt.client as mqtt
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULE_PATH = REPO_ROOT / "mqtt_llm.py"
+TELEMETRY_MODULE_PATH = REPO_ROOT / "mqtt_telemetry.py"
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 _module_counter = itertools.count()
+_telemetry_module_counter = itertools.count()
 
 
 def free_port() -> int:
@@ -274,3 +281,158 @@ def fake_ollama():
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
+
+
+# ------------------------------
+# mqtt_telemetry.py loader + fake jtop
+# ------------------------------
+
+BASELINE_JTOP_STATS = {
+    "CPU1": 5.0, "CPU2": 8.0, "CPU3": 3.0, "CPU4": 6.0,
+    "Temp cpu": 45.0, "Temp gpu": 44.0, "Temp tj": -256,  # -256 = sensor absent
+    "RAM": 0.35, "SWAP": 0.0, "GPU": 12.5,
+    "uptime": datetime.timedelta(seconds=3725),
+    "Power TOT": 4200,
+}
+BASELINE_JTOP_FAN = {"pwmfan": {"speed": [60], "rpm": [1500]}}
+
+
+class FakeJetson:
+    """Stand-in for a jtop instance, for calling publish_telemetry() directly."""
+
+    def __init__(self, stats=None, fan=None):
+        self._stats = stats if stats is not None else {}
+        self._fan = fan if fan is not None else {}
+
+    @property
+    def stats(self):
+        return self._stats
+
+    @property
+    def fan(self):
+        return self._fan
+
+
+class RaisingFakeJetson:
+    """A jtop stand-in whose .stats access fails, for exception-path tests."""
+
+    def __init__(self, error):
+        self._error = error
+
+    @property
+    def stats(self):
+        raise self._error
+
+    @property
+    def fan(self):
+        return {}
+
+
+def _install_fake_jtop(stats=None, fan=None, enter_error=None):
+    """Install a minimal fake `jtop` module into sys.modules.
+
+    mqtt_telemetry.py does `from jtop import jtop`; the real jetson-stats
+    package needs actual Jetson hardware and the jetson_stats service, so
+    it isn't usable here. This fakes just the shape the script relies on:
+    a context manager exposing .stats / .fan. Returns a dict tracking how
+    many times __enter__ was called, so tests can confirm jtop() was
+    actually invoked.
+    """
+    enter_count = {"n": 0}
+
+    class FakeJtopContextManager:
+        def __enter__(self):
+            enter_count["n"] += 1
+            if enter_error is not None:
+                raise enter_error
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def stats(self):
+            return stats if stats is not None else {}
+
+        @property
+        def fan(self):
+            return fan if fan is not None else {}
+
+    fake_module = types.ModuleType("jtop")
+    fake_module.jtop = FakeJtopContextManager
+    sys.modules["jtop"] = fake_module
+    return enter_count
+
+
+def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fan=None, jtop_enter_error=None):
+    """Load a fresh, isolated instance of mqtt_telemetry.py for testing.
+
+    Mirrors load_mqtt_llm(): connect()/loop_start() are stubbed,
+    signal.signal() is stubbed, and exec_module() runs on a background
+    thread. mqtt_telemetry.py has no shutdown_event to trigger
+    externally - instead its main loop blocks in
+    time.sleep(PUBLISH_INTERVAL) between publishes, so time.sleep is
+    patched to raise SystemExit on its first call: the same effect
+    handle_exit() has in production when a signal arrives during that
+    sleep. That lets the module publish once for real (against the fake
+    jtop given here) and then run its own shutdown/cleanup code, exactly
+    like a real SIGTERM would.
+
+    If jtop_enter_error is given, jtop().__enter__() raises it instead;
+    the module's own `except Exception: raise` then lets it propagate
+    out of this function for real (this function re-raises it), so
+    callers can assert on the "let systemd restart" path with
+    pytest.raises(...).
+    """
+    mocks = dict(client_method_mocks or {})
+    mocks.setdefault("connect", MagicMock(return_value=None))
+    mocks.setdefault("loop_start", MagicMock(return_value=None))
+
+    enter_count = _install_fake_jtop(stats=jtop_stats, fan=jtop_fan, enter_error=jtop_enter_error)
+
+    mod_name = f"mqtt_telemetry_under_test_{next(_telemetry_module_counter)}"
+    spec = importlib.util.spec_from_file_location(mod_name, TELEMETRY_MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+
+    exec_errors = []
+
+    def fake_sleep(seconds):
+        raise SystemExit
+
+    def run():
+        with patch.object(sys, "argv", ["mqtt_telemetry.py", *argv]), \
+             patch("signal.signal"), \
+             patch("time.sleep", side_effect=fake_sleep), \
+             _patched_client_methods(mocks):
+            try:
+                spec.loader.exec_module(module)
+            except Exception as e:
+                exec_errors.append(e)
+
+    loader_thread = threading.Thread(target=run, name="mqtt-telemetry-test-loader", daemon=True)
+    loader_thread.start()
+    loader_thread.join(timeout=15)
+
+    sys.modules.pop(mod_name, None)
+    sys.modules.pop("jtop", None)
+
+    if loader_thread.is_alive():
+        raise RuntimeError("mqtt_telemetry.py did not finish within the timeout")
+    if exec_errors:
+        raise exec_errors[0]
+
+    module.jtop_enter_count = enter_count["n"]
+    return module
+
+
+@pytest.fixture
+def loaded_telemetry_module():
+    """A safely-loaded mqtt_telemetry module instance: connect()/loop_start()
+    stubbed, one publish cycle executed against a fake jtop with baseline
+    stats, then shut down via a simulated signal - same as a real SIGTERM
+    arriving during the interval sleep."""
+    return load_mqtt_telemetry(
+        ["--broker", "127.0.0.1", "--loglevel", "DEBUG"],
+        jtop_stats=BASELINE_JTOP_STATS,
+        jtop_fan=BASELINE_JTOP_FAN,
+    )
