@@ -16,10 +16,8 @@ import sys
 import threading
 import time
 
-import pytest
-
 import paho.mqtt.client as mqtt
-
+import pytest
 from conftest import MODULE_PATH, free_port
 
 
@@ -331,7 +329,7 @@ def test_broker_restart_reconnects_and_resumes_serving(fake_ollama, tmp_path):
         # design discussion on clean vs. persistent sessions). Retry a
         # couple of times so this test is about reconnect behavior, not
         # single-publish timing luck.
-        for attempt in range(3):
+        for _attempt in range(3):
             probe.publish("orin/ollama/request", json.dumps({
                 "request_id": request_id, "model": "llama3", "system": "s", "user": "u",
             }), qos=1)

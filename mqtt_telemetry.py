@@ -6,11 +6,11 @@ import logging
 import signal
 import threading
 import time
+from pathlib import Path
+from typing import Any
 
 import paho.mqtt.client as mqtt
 from jtop import jtop
-from pathlib import Path
-from typing import Any, Dict, Optional
 
 # ------------------------------
 # Command-line arguments
@@ -47,7 +47,7 @@ MQTT_BROKER: str = args.broker
 MQTT_PORT: int = args.port
 MQTT_TOPIC: str = args.topic
 PUBLISH_INTERVAL: int = args.interval
-USERNAME: Optional[str] = args.username
+USERNAME: str | None = args.username
 CRED_PATH = Path(args.credpath) if args.credpath else None
 
 # ------------------------------
@@ -74,7 +74,7 @@ def on_connect(
     userdata: Any,
     flags: mqtt.ConnectFlags,
     reason_code: mqtt.ReasonCode,
-    properties: Optional[mqtt.Properties],
+    properties: mqtt.Properties | None,
 ) -> None:
     # paho re-raises exceptions escaping this callback, which kills its network
     # loop thread for good, so every path out of here must be caught locally.
@@ -93,7 +93,7 @@ def on_disconnect(
     userdata: Any,
     flags: mqtt.DisconnectFlags,
     reason_code: mqtt.ReasonCode,
-    properties: Optional[mqtt.Properties],
+    properties: mqtt.Properties | None,
 ) -> None:
     try:
         if reason_code != 0:
@@ -164,7 +164,7 @@ except Exception as e:
     log.error(f"Failed to start MQTT network loop: {e}")
     raise  # let systemd restart
 
-def handle_exit(signum: int, frame: Optional[Any]) -> None:
+def handle_exit(signum: int, frame: Any | None) -> None:
     log.info(f"Received signal {signum}, shutting down...")
     raise SystemExit
 
@@ -216,7 +216,7 @@ def publish_telemetry(jetson: jtop) -> None:
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
                 log.warning(f"Publish returned error code: {info.rc}")
         else:
-            log.debug(f"Not publishing; client is not connected!")
+            log.debug("Not publishing; client is not connected!")
     except Exception as e:
         log.error(f"Telemetry publish error: {e}")
 

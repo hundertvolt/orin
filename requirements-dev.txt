@@ -1,4 +1,5 @@
 # Dev/check toolchain: everything needed to run the test suite (see
-# tests/requirements.txt) plus static type checking.
+# tests/requirements.txt) plus static type checking and linting.
 -r tests/requirements.txt
 mypy
+ruff

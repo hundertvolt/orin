@@ -12,10 +12,8 @@ import sys
 import threading
 import time
 
-import pytest
-
 import paho.mqtt.client as mqtt
-
+import pytest
 from conftest import FIXTURES_DIR, TELEMETRY_MODULE_PATH, free_port
 
 

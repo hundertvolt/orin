@@ -13,8 +13,6 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import ValidationError
-
 
 # ------------------------------
 # on_connect

@@ -9,12 +9,11 @@ import signal
 import socket
 import threading
 import time
-
-import paho.mqtt.client as mqtt
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
+import paho.mqtt.client as mqtt
 from pydantic import BaseModel, Field, ValidationError
 
 # ------------------------------
@@ -52,7 +51,7 @@ MQTT_BROKER: str = args.broker
 MQTT_PORT: int = args.port
 MQTT_TOPIC: str = args.topic
 MQTT_STATUS_TOPIC: str = f"{MQTT_TOPIC}/status"
-USERNAME: Optional[str] = args.username
+USERNAME: str | None = args.username
 CRED_PATH = Path(args.credpath) if args.credpath else None
 OLLAMA_HOST: str = args.ollama_host
 OLLAMA_PORT: int = args.ollama_port
@@ -87,11 +86,11 @@ class OllamaRequest(BaseModel):
     model: str = Field(strict=True)
     system: str = Field(strict=True)
     user: str = Field(strict=True)
-    temperature: Optional[float] = Field(default=None, strict=True)
-    top_p: Optional[float] = Field(default=None, strict=True)
-    top_k: Optional[int] = Field(default=None, strict=True)
+    temperature: float | None = Field(default=None, strict=True)
+    top_p: float | None = Field(default=None, strict=True)
+    top_k: int | None = Field(default=None, strict=True)
 
-    def to_ollama_options(self) -> Dict[str, Any]:
+    def to_ollama_options(self) -> dict[str, Any]:
         return self.model_dump(include={"temperature", "top_p", "top_k"}, exclude_none=True)
 
 def format_validation_error(exc: ValidationError) -> str:
@@ -119,7 +118,7 @@ def publish_response(
     except Exception as e:
         log.error(f"Failed to publish response for request_id={request_id}: {e}")
 
-def handle_request_error(request_id: Optional[str], code: ErrorCode, message: Any) -> None:
+def handle_request_error(request_id: str | None, code: ErrorCode, message: Any) -> None:
     error_message = str(message)
     log.error(f"[error_code={int(code)}] request_id={request_id}: {error_message}")
 
@@ -155,14 +154,14 @@ class ActiveGeneration:
 
     def __init__(self, conn: http.client.HTTPConnection) -> None:
         self._conn = conn
-        self._sock: Optional[socket.socket] = None
+        self._sock: socket.socket | None = None
 
     @property
     def conn(self) -> http.client.HTTPConnection:
         return self._conn
 
     @property
-    def sock(self) -> Optional[socket.socket]:
+    def sock(self) -> socket.socket | None:
         return self._sock
 
     def connect(self) -> None:
@@ -184,7 +183,7 @@ class ActiveGeneration:
         except OSError:
             pass  # already closed/disconnected - nothing to clean up
 
-active_responses: Dict[str, ActiveGeneration] = {}
+active_responses: dict[str, ActiveGeneration] = {}
 
 class GenerationCancelled(Exception):
     """Raised when an in-flight Ollama generation is aborted due to shutdown."""
@@ -198,7 +197,7 @@ def on_connect(
     userdata: Any,
     flags: mqtt.ConnectFlags,
     reason_code: mqtt.ReasonCode,
-    properties: Optional[mqtt.Properties],
+    properties: mqtt.Properties | None,
 ) -> None:
     # paho re-raises exceptions escaping this callback, which kills its network
     # loop thread for good, so every path out of here must be caught locally.
@@ -220,7 +219,7 @@ def on_disconnect(
     userdata: Any,
     flags: mqtt.DisconnectFlags,
     reason_code: mqtt.ReasonCode,
-    properties: Optional[mqtt.Properties],
+    properties: mqtt.Properties | None,
 ) -> None:
     try:
         if reason_code != 0:
@@ -295,8 +294,8 @@ def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
 # Ollama worker
 # ------------------------------
 
-def build_ollama_payload(request: OllamaRequest) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
+def build_ollama_payload(request: OllamaRequest) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "model": request.model,
         "system": request.system,
         "prompt": request.user,
@@ -309,13 +308,13 @@ def build_ollama_payload(request: OllamaRequest) -> Dict[str, Any]:
 
     return payload
 
-def stream_ollama_generate(request: OllamaRequest) -> Dict[str, Any]:
+def stream_ollama_generate(request: OllamaRequest) -> dict[str, Any]:
     payload = build_ollama_payload(request)
     body = json.dumps(payload).encode("utf-8")
 
     response_parts = []
     thinking_parts = []  # some reasoning models stream a separate "thinking" field
-    final_meta: Dict[str, Any] = {}
+    final_meta: dict[str, Any] = {}
 
     start = time.monotonic()
     last_progress_log = start
@@ -484,7 +483,7 @@ except Exception as e:
 # Shutdown handling
 # ------------------------------
 
-def handle_exit(signum: int, frame: Optional[Any]) -> None:
+def handle_exit(signum: int, frame: Any | None) -> None:
     log.info(f"Received signal {signum}, shutting down...")
     shutdown_event.set()
     connected_event.set()  # wake wait_for_mqtt_connection() promptly too, if it's blocked there
