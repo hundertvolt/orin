@@ -85,6 +85,15 @@ def load_mqtt_llm(argv, client_method_mocks=None):
     existence, and set() it - the same real signal handle_exit() would
     set. That lets the module's own shutdown/cleanup code run for
     real, synchronously, with real threading semantics intact.
+
+    mqtt_llm.py also now blocks earlier, in wait_for_mqtt_connection(),
+    until is_connected() is True or shutdown_event is set. Since
+    connect()/loop_start() are stubbed, is_connected() never turns True
+    on its own here, so shutdown_event.set() alone would only be
+    noticed once connected_event.wait()'s own timeout elapses (5s) -
+    handle_exit() sets both events together for exactly this reason, so
+    we do too, to unblock that wait promptly instead of eating a real
+    5-second delay on every load.
     """
     mocks = dict(client_method_mocks or {})
     mocks.setdefault("connect", MagicMock(return_value=None))
@@ -123,6 +132,7 @@ def load_mqtt_llm(argv, client_method_mocks=None):
         raise RuntimeError("mqtt_llm.py did not reach shutdown_event definition in time")
 
     module.shutdown_event.set()  # same trigger handle_exit() uses on SIGTERM/SIGINT
+    module.connected_event.set()  # handle_exit() sets this too, to unblock wait_for_mqtt_connection()
     loader_thread.join(timeout=15)
     sys.modules.pop(mod_name, None)
 

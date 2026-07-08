@@ -11,6 +11,8 @@ time.sleep() is unblocked without a real signal.
 """
 import itertools
 import json
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,6 +47,72 @@ def test_jtop_never_started_until_connected():
 
     assert m.jtop_enter_count == 1
     assert is_connected.call_count >= 3  # polled until it actually turned True
+
+
+def test_wait_for_mqtt_connection_blocks_until_connected():
+    """Core regression test for the check-clear-check race fix: the wait
+    must not return early just because connected_event was set - it must
+    re-check is_connected() too, and keep blocking for real until the
+    connection has actually settled. Called directly (via an already
+    fully-loaded-and-shut-down module) rather than through
+    load_mqtt_telemetry() itself, since the loader defaults is_connected
+    to True and patches threading.Event.wait globally to avoid a real
+    stall on every test load - which leaves nothing interesting to
+    observe for this race specifically.
+    """
+    m = load_mqtt_telemetry(
+        ["--broker", "127.0.0.1"],
+        jtop_stats=BASELINE_JTOP_STATS, jtop_fan=BASELINE_JTOP_FAN,
+    )
+    is_connected_flag = threading.Event()
+    m.client.is_connected = MagicMock(side_effect=is_connected_flag.is_set)
+
+    result_holder = {}
+
+    def run():
+        m.wait_for_mqtt_connection()
+        result_holder["done"] = True
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.2)
+        assert "done" not in result_holder, "returned before the connection ever settled"
+
+        is_connected_flag.set()
+        m.connected_event.set()
+        t.join(timeout=2)
+
+        assert not t.is_alive()
+        assert result_holder.get("done") is True
+    finally:
+        if t.is_alive():
+            is_connected_flag.set()
+            m.connected_event.set()
+            t.join(timeout=2)
+
+
+def test_wait_for_mqtt_connection_logs_periodically_while_waiting(caplog):
+    caplog.set_level("WARNING")
+    m = load_mqtt_telemetry(
+        ["--broker", "127.0.0.1"],
+        jtop_stats=BASELINE_JTOP_STATS, jtop_fan=BASELINE_JTOP_FAN,
+    )
+    m.CONNECT_RETRY_LOG_INTERVAL = 0.05
+    m.client.is_connected = MagicMock(return_value=False)
+
+    t = threading.Thread(target=m.wait_for_mqtt_connection, daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "Still waiting for MQTT connection" not in caplog.text:
+            time.sleep(0.02)
+        assert "Still waiting for MQTT connection" in caplog.text
+    finally:
+        m.client.is_connected = MagicMock(return_value=True)
+        m.connected_event.set()
+        t.join(timeout=2)
+        assert not t.is_alive()
 
 
 def test_will_set_registers_offline_lwt_before_connect():

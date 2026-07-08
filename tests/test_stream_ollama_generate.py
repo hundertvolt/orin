@@ -262,4 +262,42 @@ def test_active_generation_sock_survives_getresponse_and_unblocks_read(loaded_mo
         )
     finally:
         m.shutdown_event.clear()
-        t.join(timeout=5)
+
+
+def test_shutdown_already_set_cancels_before_any_connection_attempt(loaded_module, fake_ollama):
+    """Regression test for the TOCTOU race fix: the shutdown_event check
+    and active_responses registration happen under the same lock the
+    shutdown block uses to snapshot and interrupt in-flight generations.
+    If shutdown_event is already set by the time this is called (e.g. a
+    request was dequeued right as shutdown began, after the shutdown
+    block's own snapshot-and-interrupt loop already ran), it must bail
+    out as GenerationCancelled immediately - never opening a real
+    connection, since nothing will be there to interrupt it."""
+    m = loaded_module
+    m.OLLAMA_HOST = "127.0.0.1"
+    m.OLLAMA_PORT = fake_ollama.server_address[1]
+    m.shutdown_event.set()
+    try:
+        with pytest.raises(m.GenerationCancelled):
+            m.stream_ollama_generate(_make_request(m))
+    finally:
+        m.shutdown_event.clear()
+
+    assert fake_ollama.received_requests == [], "must not attempt a connection once shutdown has begun"
+    assert m.active_responses == {}
+
+
+def test_non_dict_chunk_raises_clear_error_not_attribute_error(loaded_module, fake_ollama):
+    """Regression test: a protocol-violating chunk (valid JSON, but not
+    an object - e.g. a bare array) must not fall through to a raw
+    AttributeError from chunk.get(...)/final_meta.items()."""
+    m = loaded_module
+    m.OLLAMA_HOST = "127.0.0.1"
+    m.OLLAMA_PORT = fake_ollama.server_address[1]
+    fake_ollama.scenario = "success"
+    fake_ollama.chunks = [{"response": "partial"}, [1, 2, 3]]
+
+    with pytest.raises(RuntimeError, match="non-object chunk"):
+        m.stream_ollama_generate(_make_request(m))
+
+    assert m.active_responses == {}
