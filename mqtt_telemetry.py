@@ -50,7 +50,7 @@ log = logging.getLogger("orin_mqtt")
 # MQTT setup
 # ------------------------------
 
-CONNECT_SETTLE_TIMEOUT = 5.0  # bounded wait for the initial CONNACK, see below
+CONNECT_RETRY_LOG_INTERVAL = 5.0  # how often to log while waiting for a connection
 
 connected_event = threading.Event()
 
@@ -75,6 +75,33 @@ def on_disconnect(cli: mqtt.Client, userdata: Any, flags: Dict[str, int], reason
             log.info("MQTT disconnected cleanly")
     except Exception as e:
         log.error(f"Unhandled error in on_disconnect: {e}")
+
+def wait_for_mqtt_connection() -> None:
+    """Block until the MQTT client is genuinely connected.
+
+    jtop() must never be started while disconnected: client.connect()
+    only sends the CONNECT packet, and the CONNACK that actually flips
+    is_connected() to True is processed asynchronously by the loop
+    thread. Proceeding to jtop() without waiting for that risks a race
+    where a fast jtop() failure checks is_connected() before the CONNACK
+    lands, skipping the shutdown path's offline publish - and by the
+    time the connection does settle moments later, the resulting
+    disconnect() looks clean, which cancels LWT delivery too. Net
+    effect: no offline announcement at all.
+
+    paho's own reconnect_delay_set backoff is already retrying in the
+    background regardless; this just waits for it to succeed (or for a
+    shutdown signal to interrupt the wait), logging periodically so a
+    persistent outage stays visible instead of being silently retried
+    forever.
+    """
+    while not client.is_connected():
+        connected_event.clear()
+        if not connected_event.wait(timeout=CONNECT_RETRY_LOG_INTERVAL):
+            log.warning(
+                f"Still waiting for MQTT connection after {CONNECT_RETRY_LOG_INTERVAL}s; "
+                "retrying in the background..."
+            )
 
 client = mqtt.Client(client_id="orin_nano", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.max_queued_messages_set(5)
@@ -104,21 +131,15 @@ except Exception as e:
 
 client.loop_start()  # background loop handles reconnects
 
-# client.connect() only sends the CONNECT packet; the CONNACK that actually
-# flips is_connected() to True is processed asynchronously by the loop
-# thread just started above. Without waiting for it here, a fast-failing
-# jtop() below could lose the race against that callback: is_connected()
-# would read False when the shutdown path checks it (skipping the offline
-# publish), while the CONNACK arrives moments later and lets the eventual
-# disconnect() go out clean - which cancels LWT delivery too. Net result:
-# no offline announcement at all. Waiting (bounded) for the connection to
-# settle before ever attempting jtop() closes that race: from here on,
-# is_connected() reflects a state that isn't still in flight.
-if not connected_event.wait(timeout=CONNECT_SETTLE_TIMEOUT):
-    log.warning(
-        f"No MQTT CONNACK within {CONNECT_SETTLE_TIMEOUT}s; proceeding anyway "
-        "(the background loop keeps retrying)."
-    )
+def handle_exit(signum: int, frame: Optional[Any]) -> None:
+    log.info(f"Received signal {signum}, shutting down...")
+    raise SystemExit
+
+# Registered here, before wait_for_mqtt_connection() is ever called, so a
+# signal arriving while still waiting for the initial connection can
+# interrupt that wait too, not just the publish loop below.
+signal.signal(signal.SIGTERM, handle_exit)
+signal.signal(signal.SIGINT, handle_exit)
 
 # ------------------------------
 # Telemetry publishing
@@ -167,18 +188,12 @@ def publish_telemetry(jetson: jtop) -> None:
         log.error(f"Telemetry publish error: {e}")
 
 
-def handle_exit(signum: int, frame: Optional[Any]) -> None:
-    log.info(f"Received signal {signum}, shutting down...")
-    raise SystemExit
-
-signal.signal(signal.SIGTERM, handle_exit)
-signal.signal(signal.SIGINT, handle_exit)
-
 # ------------------------------
 # Main loop using jtop
 # ------------------------------
 
 try:
+    wait_for_mqtt_connection()
     with jtop() as jetsonTop:
         log.info(f"Telemetry service started using topic: {MQTT_TOPIC}.")
         while True:

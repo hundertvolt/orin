@@ -378,15 +378,26 @@ def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fa
     jtop given here) and then run its own shutdown/cleanup code, exactly
     like a real SIGTERM would.
 
-    Since connect()/loop_start() are stubbed, on_connect() never fires
-    naturally, so connected_event (which the script waits on, bounded,
-    right after loop_start() - see mqtt_telemetry.py for why) would
-    never get set(). threading.Event.wait is patched to return
-    immediately (no other code here starts real threads during this
-    call, so this doesn't hit the Thread-internals hazard that ruled
-    out the same trick for shutdown_event in load_mqtt_llm()). This
-    only unblocks the wait - it has no effect on what is_connected()
-    reports, which client_method_mocks controls separately.
+    mqtt_telemetry.py now also refuses to call jtop() at all until
+    wait_for_mqtt_connection() sees is_connected() return True. Since
+    connect()/loop_start() are stubbed, on_connect() never fires
+    naturally and is_connected() would default to the real (never
+    truly connected) paho state - which would make that wait loop
+    forever for every test, not just the ones specifically interested
+    in it. So is_connected defaults to True here (connect()/loop_start()
+    already default to "succeeded" no-ops; this keeps that same
+    "happy path by default" story), which resolves the wait on its very
+    first check without needing threading.Event.wait at all. Pass a
+    stateful is_connected mock (e.g. true-then-false, for "was connected,
+    then dropped by shutdown time") to override this for a specific test.
+
+    threading.Event.wait is still patched to return immediately, as a
+    safety net for any test that does exercise the wait loop with a
+    genuinely-not-yet-connected is_connected mock (no other code here
+    starts real threads during this call, so this doesn't hit the
+    Thread-internals hazard that ruled out the same trick for
+    shutdown_event in load_mqtt_llm()). This has no effect on what
+    is_connected() itself reports.
 
     If jtop_enter_error is given, jtop().__enter__() raises it instead;
     the module's own `except Exception: raise` then lets it propagate
@@ -397,6 +408,7 @@ def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fa
     mocks = dict(client_method_mocks or {})
     mocks.setdefault("connect", MagicMock(return_value=None))
     mocks.setdefault("loop_start", MagicMock(return_value=None))
+    mocks.setdefault("is_connected", MagicMock(return_value=True))
 
     enter_count = _install_fake_jtop(stats=jtop_stats, fan=jtop_fan, enter_error=jtop_enter_error)
 

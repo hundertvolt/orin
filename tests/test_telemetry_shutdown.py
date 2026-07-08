@@ -9,12 +9,42 @@ here, different jtop behavior) in place beforehand. See
 load_mqtt_telemetry() in conftest.py for how the main loop's blocking
 time.sleep() is unblocked without a real signal.
 """
+import itertools
 import json
 from unittest.mock import MagicMock
 
 import pytest
 
 from conftest import BASELINE_JTOP_FAN, BASELINE_JTOP_STATS, load_mqtt_telemetry
+
+
+def _connected_then_dropped():
+    """is_connected() mock: True on the first call (passes
+    wait_for_mqtt_connection()'s startup gate), False on every call
+    after - simulating a connection that was fine at startup but has
+    dropped by the time the shutdown path checks it."""
+    return MagicMock(side_effect=itertools.chain([True], itertools.repeat(False)))
+
+
+# ------------------------------
+# Connection gating before jtop()
+# ------------------------------
+
+def test_jtop_never_started_until_connected():
+    """Core regression test for wait_for_mqtt_connection(): jtop() must
+    not be entered until is_connected() actually returns True - not
+    proceed anyway after a bounded grace period (the earlier, looser
+    version of this fix)."""
+    is_connected = MagicMock(side_effect=[False, False, True] + [True] * 20)
+
+    m = load_mqtt_telemetry(
+        ["--broker", "127.0.0.1"],
+        client_method_mocks={"is_connected": is_connected},
+        jtop_stats=BASELINE_JTOP_STATS, jtop_fan=BASELINE_JTOP_FAN,
+    )
+
+    assert m.jtop_enter_count == 1
+    assert is_connected.call_count >= 3  # polled until it actually turned True
 
 
 def test_will_set_registers_offline_lwt_before_connect():
@@ -81,7 +111,7 @@ def test_shutdown_publishes_offline_status_when_connected(caplog):
 def test_shutdown_skips_offline_publish_when_not_connected(caplog):
     caplog.set_level("INFO")
     publish = MagicMock()
-    is_connected = MagicMock(return_value=False)
+    is_connected = _connected_then_dropped()
     loop_stop = MagicMock()
     disconnect = MagicMock()
 
@@ -105,7 +135,7 @@ def test_shutdown_survives_loop_stop_exception(caplog):
     disconnect() sequence in one try/except - a failure partway through
     must not prevent 'Shutdown complete.' from being logged."""
     caplog.set_level("INFO")
-    is_connected = MagicMock(return_value=False)
+    is_connected = _connected_then_dropped()
     loop_stop = MagicMock(side_effect=RuntimeError("thread join failed"))
     disconnect = MagicMock()
 
@@ -125,7 +155,7 @@ def test_shutdown_survives_loop_stop_exception(caplog):
 
 def test_shutdown_survives_disconnect_exception(caplog):
     caplog.set_level("INFO")
-    is_connected = MagicMock(return_value=False)
+    is_connected = _connected_then_dropped()
     loop_stop = MagicMock()
     disconnect = MagicMock(side_effect=OSError("socket already gone"))
 

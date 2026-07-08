@@ -6,6 +6,7 @@ jetson-stats needs actual Jetson hardware and isn't installable here).
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -15,7 +16,7 @@ import pytest
 
 import paho.mqtt.client as mqtt
 
-from conftest import FIXTURES_DIR, TELEMETRY_MODULE_PATH
+from conftest import FIXTURES_DIR, TELEMETRY_MODULE_PATH, free_port
 
 
 class ServiceProcess:
@@ -220,3 +221,57 @@ def test_jtop_failure_exits_nonzero_and_still_publishes_offline(telemetry_servic
     topic, payload, retain = received[-1]
     assert json.loads(payload) == {"heartbeat": 0, "status": "offline"}
     _assert_retained(mosquitto_broker, "orin/status", {"heartbeat": 0, "status": "offline"})
+
+
+def test_jtop_never_started_and_signal_interrupts_indefinite_wait():
+    """Regression test, end to end, for the connection-gating fix: point
+    at a listener that accepts the TCP connection but never sends a
+    CONNACK (no MQTT broker at all, just a raw socket held open), so the
+    connection genuinely never settles. jtop() must never be attempted
+    (no "Telemetry service started" line), the periodic warning must
+    fire for real, and a SIGTERM must still interrupt the indefinite
+    wait cleanly - proving it isn't a silent, unbreakable hang.
+    """
+    port = free_port()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+
+    def accept_and_hold():
+        try:
+            conn, _ = srv.accept()
+            conn.settimeout(30)
+            try:
+                conn.recv(1)  # blocks until the client closes or we time out
+            except OSError:
+                pass
+        except OSError:
+            pass  # srv.close() below unblocks a pending accept()
+
+    holder = threading.Thread(target=accept_and_hold, daemon=True)
+    holder.start()
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(FIXTURES_DIR / "fake_jtop_success")
+    proc = subprocess.Popen(
+        [sys.executable, str(TELEMETRY_MODULE_PATH),
+         "--broker", "127.0.0.1", "--port", str(port), "--topic", "orin/status", "--loglevel", "DEBUG"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+    )
+    svc = ServiceProcess(proc)
+    try:
+        assert svc.wait_for_log("Still waiting for MQTT connection", timeout=8), svc.text()
+        assert "Telemetry service started" not in svc.text(), \
+            "jtop() must not be attempted before the connection is established: " + svc.text()
+
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=10)
+
+        assert rc == 0, "SIGTERM should still interrupt an indefinite connection wait: " + svc.text()
+        assert "Telemetry service started" not in svc.text()
+        assert "Shutdown complete." in svc.text()
+    finally:
+        svc.stop()
+        srv.close()
+        holder.join(timeout=2)
