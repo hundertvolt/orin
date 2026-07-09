@@ -32,6 +32,12 @@ def _positive_float(value: str) -> float:
         raise argparse.ArgumentTypeError(f"must be positive, got {fvalue}")
     return fvalue
 
+def _positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {ivalue}")
+    return ivalue
+
 logChoices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 parser = argparse.ArgumentParser(description="MQTT interface to Ollama")
 parser.add_argument("--broker", required=True, help="MQTT broker IP or hostname")
@@ -44,6 +50,7 @@ parser.add_argument("--ollama-port", type=_port_type, default="11434", help="Oll
 parser.add_argument("--connect-timeout", type=_positive_float, default=5.0, help="Max seconds to establish Ollama TCP connection")
 parser.add_argument("--stream-timeout", type=_positive_float, default=120.0, help="Max seconds of silence between streamed chunks")
 parser.add_argument("--shutdown-timeout", type=_positive_float, default=5.0, help="Max seconds to full service shutdown")
+parser.add_argument("--interval", type=_positive_int, default=10, help="Status message publish interval in seconds")
 parser.add_argument("--loglevel", default="INFO", choices=logChoices, help="Logging level")
 args = parser.parse_args()
 
@@ -59,6 +66,7 @@ OLLAMA_PATH: str = "/api/generate"
 OLLAMA_CONNECT_TIMEOUT: float = args.connect_timeout
 OLLAMA_STREAM_IDLE_TIMEOUT: float = args.stream_timeout
 SHUTDOWN_TIMEOUT: float = args.shutdown_timeout
+STATUS_INTERVAL: int = args.interval
 
 # ------------------------------
 # Logging setup
@@ -189,6 +197,56 @@ class GenerationCancelled(Exception):
     """Raised when an in-flight Ollama generation is aborted due to shutdown."""
 
 # ------------------------------
+# Queue status tracking
+# ------------------------------
+# Insertion order == processing order (queue_status is a plain dict, and
+# request_queue is FIFO), so this doubles as the queue's own order record -
+# no separate structure needed to answer "what order will these process in".
+queue_status_lock = threading.Lock()
+queue_status: dict[str, dict[str, int]] = {}
+
+def update_queue_progress(request_id: str, response_chars: int, thinking_chars: int) -> None:
+    with queue_status_lock:
+        entry = queue_status.get(request_id)
+        if entry is not None:  # already removed (e.g. shutdown drained it) - nothing to update
+            entry["response_chars"] = response_chars
+            entry["thinking_chars"] = thinking_chars
+
+def build_queue_snapshot() -> list[dict[str, Any]]:
+    """The queue's essence for a status subscriber: IDs in the order
+    they'll be processed, each with independent response/thinking
+    progress counters. Both counters follow the same convention: -1
+    queued but not yet started, 0 started with nothing generated yet,
+    otherwise the current character count."""
+    with queue_status_lock:
+        return [
+            {
+                "request_id": request_id,
+                "response_chars": entry["response_chars"],
+                "thinking_chars": entry["thinking_chars"],
+            }
+            for request_id, entry in queue_status.items()
+        ]
+
+def build_status_payload(online: bool) -> dict[str, Any]:
+    if not online:
+        return {"status": "offline", "heartbeat": None, "queue": None}
+    return {
+        "status": "online",
+        "heartbeat": int(time.time()),
+        "queue": build_queue_snapshot(),
+    }
+
+def publish_status(cli: mqtt.Client, online: bool = True) -> None:
+    payload = build_status_payload(online)
+    try:
+        info = cli.publish(MQTT_STATUS_TOPIC, json.dumps(payload), qos=1, retain=True)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            log.warning(f"Status publish returned error code: {info.rc}")
+    except Exception as e:
+        log.error(f"Failed to publish status: {e}")
+
+# ------------------------------
 # MQTT setup
 # ------------------------------
 
@@ -206,7 +264,7 @@ def on_connect(
             sub_topic = f"{MQTT_TOPIC}/request"
             log.info(f"Connected to MQTT broker, listening to '{sub_topic}'.")
             cli.subscribe(sub_topic, qos=1)
-            cli.publish(MQTT_STATUS_TOPIC, json.dumps({"status": "online"}), qos=1, retain=True)
+            publish_status(cli)
         else:
             log.error(f"MQTT connection failed: {reason_code}")
     except Exception as e:
@@ -282,11 +340,25 @@ def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
             )
             return
 
-        request_queue.put(request)
-        log.debug(
-            f"Queued request_id={request.request_id} "
-            f"(queue depth={request_queue.qsize()})"
-        )
+        with queue_status_lock:
+            queue_status[request.request_id] = {"response_chars": -1, "thinking_chars": -1}
+        try:
+            request_queue.put(request)
+            log.debug(
+                f"Queued request_id={request.request_id} "
+                f"(queue depth={request_queue.qsize()})"
+            )
+        except Exception:
+            # Roll back the tracking entry so the status published below
+            # accurately shows this request never made it into the queue.
+            with queue_status_lock:
+                queue_status.pop(request.request_id, None)
+            raise
+        finally:
+            # Published immediately (not just on the periodic interval) so
+            # the requestor can see their ID land in the queue right away,
+            # or notice its absence if something above removed it again.
+            publish_status(cli)
     except Exception as e:
         log.error(f"Unhandled error in on_message: {e}")
 
@@ -363,6 +435,12 @@ def stream_ollama_generate(request: OllamaRequest) -> dict[str, Any]:
                 if chunk.get("thinking"):
                     thinking_parts.append(chunk["thinking"])
 
+                update_queue_progress(
+                    request.request_id,
+                    response_chars=sum(len(p) for p in response_parts),
+                    thinking_chars=sum(len(p) for p in thinking_parts),
+                )
+
                 now = time.monotonic()
                 if now - last_progress_log >= 5.0:
                     log.info(
@@ -415,8 +493,16 @@ def ollama_worker() -> None:
 
         if shutdown_event.is_set():  # drain queue on shutdown
             log.info(f"Discarding queued request_id={request.request_id} due to shutdown")
+            with queue_status_lock:
+                queue_status.pop(request.request_id, None)
             request_queue.task_done()
             continue
+
+        with queue_status_lock:
+            entry = queue_status.get(request.request_id)
+            if entry is not None:  # dequeued: started, nothing generated yet
+                entry["response_chars"] = 0
+                entry["thinking_chars"] = 0
 
         try:
             log.info(f"Calling Ollama for request_id={request.request_id}")
@@ -437,6 +523,12 @@ def ollama_worker() -> None:
         except Exception as e:
             handle_request_error(request.request_id, ErrorCode.OLLAMA_ERROR, f"unexpected error: {e}")
         finally:
+            with queue_status_lock:
+                queue_status.pop(request.request_id, None)
+            if not shutdown_event.is_set():
+                # Shutdown publishes its own final offline status right
+                # after this; skip the redundant online one mid-teardown.
+                publish_status(client)
             request_queue.task_done()
 
     log.info("Worker thread stopped")
@@ -448,7 +540,7 @@ def ollama_worker() -> None:
 
 client = mqtt.Client(client_id="orin_ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.max_queued_messages_set(5)
-client.will_set(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
+client.will_set(MQTT_STATUS_TOPIC, json.dumps(build_status_payload(online=False)), qos=1, retain=True)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
 client.on_connect = on_connect
 client.on_disconnect = on_disconnect
@@ -506,6 +598,23 @@ except Exception as e:
     log.error(f"Failed to start worker thread: {e}")
     raise  # let systemd restart
 
+# ------------------------------
+# Status publisher thread startup
+# ------------------------------
+
+def status_publisher() -> None:
+    log.info(f"Status publisher thread started (interval={STATUS_INTERVAL}s)")
+    while not shutdown_event.wait(timeout=STATUS_INTERVAL):
+        publish_status(client)
+    log.info("Status publisher thread stopped")
+
+status_thread = threading.Thread(target=status_publisher, name="status-publisher", daemon=True)
+try:
+    status_thread.start()
+except Exception as e:
+    log.error(f"Failed to start status publisher thread: {e}")
+    raise  # let systemd restart
+
 log.info(f"Ollama MQTT bridge started, listening on '{MQTT_TOPIC}/request'.")
 
 try:
@@ -530,9 +639,20 @@ finally:
     else:
         log.debug("Worker thread exited cleanly.")
 
+    status_thread.join(timeout=SHUTDOWN_TIMEOUT)
+
+    if status_thread.is_alive():
+        log.warning(
+            f"Status publisher thread did not finish within {SHUTDOWN_TIMEOUT}s; "
+            "proceeding with shutdown anyway - the thread is a daemon and will "
+            "be discarded on process exit."
+        )
+    else:
+        log.debug("Status publisher thread exited cleanly.")
+
     try:
         if client.is_connected():
-            info = client.publish(MQTT_STATUS_TOPIC, json.dumps({"status": "offline"}), qos=1, retain=True)
+            info = client.publish(MQTT_STATUS_TOPIC, json.dumps(build_status_payload(online=False)), qos=1, retain=True)
             info.wait_for_publish(timeout=2.0)  # ensure the offline status is sent before disconnecting
             log.debug("Offline status published.")
         client.loop_stop()

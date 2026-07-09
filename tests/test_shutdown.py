@@ -28,7 +28,9 @@ def test_will_set_registers_offline_lwt_before_connect():
     )
 
     will_set.assert_called_once_with(
-        "orin/ollama/status", json.dumps({"status": "offline"}), qos=1, retain=True
+        "orin/ollama/status",
+        json.dumps({"status": "offline", "heartbeat": None, "queue": None}),
+        qos=1, retain=True,
     )
     assert call_order == ["will_set", "connect"]
     assert m.MQTT_STATUS_TOPIC == "orin/ollama/status"
@@ -61,7 +63,9 @@ def test_shutdown_publishes_offline_status_when_connected(caplog):
     )
 
     publish.assert_called_once_with(
-        "orin/ollama/status", json.dumps({"status": "offline"}), qos=1, retain=True
+        "orin/ollama/status",
+        json.dumps({"status": "offline", "heartbeat": None, "queue": None}),
+        qos=1, retain=True,
     )
     info.wait_for_publish.assert_called_once_with(timeout=2.0)
     loop_stop.assert_called_once()

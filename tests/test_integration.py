@@ -106,7 +106,7 @@ def _wait_until(predicate, timeout=10.0, interval=0.05):
     return predicate()
 
 
-def _assert_retained(broker_port, topic, expected_payload, timeout=5.0):
+def _assert_retained(broker_port, topic, expected_payload=None, timeout=5.0, check=None):
     """Connect a brand-new client and confirm it immediately receives
     `topic` as a retained message on subscribe.
 
@@ -118,6 +118,10 @@ def _assert_retained(broker_port, topic, expected_payload, timeout=5.0):
     subscribe. So "was this actually stored as retained" has to be
     checked from a fresh subscriber's point of view, not the original
     probe's.
+
+    Pass `expected_payload` for an exact-match payload (e.g. the fully
+    deterministic offline payload), or `check` (a predicate over the
+    parsed body) when a field like `heartbeat` is inherently dynamic.
     """
     received = []
     probe = mqtt.Client(
@@ -131,7 +135,11 @@ def _assert_retained(broker_port, topic, expected_payload, timeout=5.0):
     try:
         assert _wait_until(lambda: len(received) >= 1, timeout=timeout), f"no retained message found on {topic}"
         payload, retain = received[0]
-        assert json.loads(payload) == expected_payload
+        body = json.loads(payload)
+        if check is not None:
+            assert check(body), f"retained payload failed check: {body}"
+        else:
+            assert body == expected_payload
         assert retain is True
     finally:
         probe.loop_stop()
@@ -149,8 +157,14 @@ def test_status_online_on_connect_and_offline_on_clean_shutdown(service_factory,
     assert _wait_until(lambda: len(received) >= 1), svc.text()
     topic, payload, retain = received[-1]
     assert topic == "orin/ollama/status"
-    assert json.loads(payload) == {"status": "online"}
-    _assert_retained(mosquitto_broker, "orin/ollama/status", {"status": "online"})
+    body = json.loads(payload)
+    assert body["status"] == "online"
+    assert body["queue"] == []
+    assert isinstance(body["heartbeat"], int)
+    _assert_retained(
+        mosquitto_broker, "orin/ollama/status",
+        check=lambda b: b["status"] == "online" and b["queue"] == [] and isinstance(b["heartbeat"], int),
+    )
 
     received.clear()
     svc.proc.send_signal(signal.SIGTERM)
@@ -160,8 +174,8 @@ def test_status_online_on_connect_and_offline_on_clean_shutdown(service_factory,
 
     assert _wait_until(lambda: len(received) >= 1), "no offline status observed after clean shutdown"
     topic, payload, retain = received[-1]
-    assert json.loads(payload) == {"status": "offline"}
-    _assert_retained(mosquitto_broker, "orin/ollama/status", {"status": "offline"})
+    assert json.loads(payload) == {"status": "offline", "heartbeat": None, "queue": None}
+    _assert_retained(mosquitto_broker, "orin/ollama/status", {"status": "offline", "heartbeat": None, "queue": None})
 
 
 def test_lwt_fires_on_ungraceful_kill(service_factory, probe_client, mosquitto_broker):
@@ -179,8 +193,8 @@ def test_lwt_fires_on_ungraceful_kill(service_factory, probe_client, mosquitto_b
 
     assert _wait_until(lambda: len(received) >= 1, timeout=10), "LWT was not published by the broker"
     topic, payload, retain = received[-1]
-    assert json.loads(payload) == {"status": "offline"}
-    _assert_retained(mosquitto_broker, "orin/ollama/status", {"status": "offline"})
+    assert json.loads(payload) == {"status": "offline", "heartbeat": None, "queue": None}
+    _assert_retained(mosquitto_broker, "orin/ollama/status", {"status": "offline", "heartbeat": None, "queue": None})
 
 
 def test_request_response_roundtrip(service_factory, probe_client):
@@ -245,6 +259,52 @@ def test_ollama_error_reported_without_crashing_service(service_factory, probe_c
     assert body["error_code"] == 3  # OLLAMA_ERROR
     assert "500" in body["error_message"]
     assert svc.proc.poll() is None
+
+
+def test_status_shows_queued_request_and_clears_after_completion(service_factory, probe_client):
+    """Covers the two event-driven (non-periodic) status publishes: one
+    right after a request is enqueued (so the requestor can see their ID
+    land immediately), and one right after it finishes (so the queue entry
+    disappearing is visible promptly, not just on the next periodic tick)."""
+    client, received = probe_client
+    client.subscribe("orin/ollama/status", qos=1)
+    time.sleep(0.3)
+
+    svc = service_factory(topic="orin/ollama")
+    assert svc.wait_for_log("Connected to MQTT broker"), svc.text()
+    assert _wait_until(lambda: len(received) >= 1), svc.text()  # initial online status
+    received.clear()
+
+    client.publish("orin/ollama/request", json.dumps({
+        "request_id": "status-1", "model": "llama3", "system": "s", "user": "u",
+    }), qos=1)
+
+    expected_entry = {"request_id": "status-1", "response_chars": -1, "thinking_chars": -1}
+    assert _wait_until(
+        lambda: any(json.loads(p)["queue"] == [expected_entry] for _, p, _ in received),
+        timeout=5,
+    ), f"never saw status-1 queued in a status message: {received}"
+
+    assert _wait_until(
+        lambda: bool(received) and json.loads(received[-1][1])["queue"] == [],
+        timeout=5,
+    ), f"queue never cleared after completion: {received}"
+
+
+def test_status_publishes_periodically(service_factory, probe_client):
+    client, received = probe_client
+    client.subscribe("orin/ollama/status", qos=1)
+    time.sleep(0.3)
+
+    svc = service_factory(topic="orin/ollama", extra_args=["--interval", "1"])
+    assert svc.wait_for_log("Connected to MQTT broker"), svc.text()
+
+    assert _wait_until(lambda: len(received) >= 3, timeout=6), \
+        f"expected at least 3 status publishes (1 on-connect + periodic) within a few seconds: {received}"
+    for _, payload, _ in received:
+        body = json.loads(payload)
+        assert body["status"] == "online"
+        assert body["queue"] == []
 
 
 def test_graceful_shutdown_while_generation_in_flight(service_factory, probe_client, fake_ollama):
