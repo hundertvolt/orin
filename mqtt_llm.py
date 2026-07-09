@@ -2,6 +2,7 @@
 
 import argparse
 import http.client
+import itertools
 import json
 import logging
 import queue
@@ -199,15 +200,25 @@ class GenerationCancelled(Exception):
 # ------------------------------
 # Queue status tracking
 # ------------------------------
-# Insertion order == processing order (queue_status is a plain dict, and
-# request_queue is FIFO), so this doubles as the queue's own order record -
-# no separate structure needed to answer "what order will these process in".
+# request_id is caller-supplied and must be treated as an arbitrary,
+# opaque label: it's never validated for uniqueness (or non-emptiness
+# beyond being a string), so nothing internal may use it as a lookup
+# key - two, or two hundred, queued requests can legitimately share the
+# same request_id (or all be ""). queue_status is therefore keyed by
+# _queue_seq (a private, always-unique counter assigned at enqueue
+# time), with each entry's own "request_id" field carried purely as a
+# label to report back, never as an identity. Insertion order into this
+# dict == processing order (queue_status is a plain dict, and
+# request_queue is FIFO), so this also doubles as the queue's own order
+# record - no separate structure needed to answer "what order will
+# these process in".
+_queue_seq_counter = itertools.count()
 queue_status_lock = threading.Lock()
-queue_status: dict[str, dict[str, int]] = {}
+queue_status: dict[int, dict[str, Any]] = {}
 
-def update_queue_progress(request_id: str, response_chars: int, thinking_chars: int) -> None:
+def update_queue_progress(seq: int, response_chars: int, thinking_chars: int) -> None:
     with queue_status_lock:
-        entry = queue_status.get(request_id)
+        entry = queue_status.get(seq)
         if entry is not None:  # already removed (e.g. shutdown drained it) - nothing to update
             entry["response_chars"] = response_chars
             entry["thinking_chars"] = thinking_chars
@@ -215,17 +226,21 @@ def update_queue_progress(request_id: str, response_chars: int, thinking_chars: 
 def build_queue_snapshot() -> list[dict[str, Any]]:
     """The queue's essence for a status subscriber: IDs in the order
     they'll be processed, each with independent response/thinking
-    progress counters. Both counters follow the same convention: -1
-    queued but not yet started, 0 started with nothing generated yet,
-    otherwise the current character count."""
+    progress counters. response_chars follows -1 queued but not yet
+    started, 0 started with nothing generated yet, otherwise the
+    current character count. thinking_chars follows the same -1/0/N
+    shape, but -1 also covers "no thinking activity has been observed
+    for this request yet" - since not every model streams a "thinking"
+    field, it only leaves -1 once one actually appears (see the
+    thinking_started tracking in stream_ollama_generate)."""
     with queue_status_lock:
         return [
             {
-                "request_id": request_id,
+                "request_id": entry["request_id"],
                 "response_chars": entry["response_chars"],
                 "thinking_chars": entry["thinking_chars"],
             }
-            for request_id, entry in queue_status.items()
+            for entry in queue_status.values()
         ]
 
 def build_status_payload(online: bool) -> dict[str, Any]:
@@ -237,14 +252,23 @@ def build_status_payload(online: bool) -> dict[str, Any]:
         "queue": build_queue_snapshot(),
     }
 
+# Serializes build_status_payload()+cli.publish() as one unit across
+# threads (on_message, ollama_worker, status_publisher all call this).
+# Without it, two concurrent calls could interleave so the one that
+# snapshotted queue_status *first* is still the one whose publish()
+# reaches the broker *last* - leaving a stale, smaller retained queue
+# in place of a fresher, larger one it should have superseded.
+status_publish_lock = threading.Lock()
+
 def publish_status(cli: mqtt.Client, online: bool = True) -> None:
-    payload = build_status_payload(online)
-    try:
-        info = cli.publish(MQTT_STATUS_TOPIC, json.dumps(payload), qos=1, retain=True)
-        if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            log.warning(f"Status publish returned error code: {info.rc}")
-    except Exception as e:
-        log.error(f"Failed to publish status: {e}")
+    with status_publish_lock:
+        payload = build_status_payload(online)
+        try:
+            info = cli.publish(MQTT_STATUS_TOPIC, json.dumps(payload), qos=1, retain=True)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                log.warning(f"Status publish returned error code: {info.rc}")
+        except Exception as e:
+            log.error(f"Failed to publish status: {e}")
 
 # ------------------------------
 # MQTT setup
@@ -340,10 +364,11 @@ def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
             )
             return
 
+        seq = next(_queue_seq_counter)  # unique tracking key - request_id may repeat or be ""
         with queue_status_lock:
-            queue_status[request.request_id] = {"response_chars": -1, "thinking_chars": -1}
+            queue_status[seq] = {"request_id": request.request_id, "response_chars": -1, "thinking_chars": -1}
         try:
-            request_queue.put(request)
+            request_queue.put((seq, request))
             log.debug(
                 f"Queued request_id={request.request_id} "
                 f"(queue depth={request_queue.qsize()})"
@@ -352,7 +377,7 @@ def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
             # Roll back the tracking entry so the status published below
             # accurately shows this request never made it into the queue.
             with queue_status_lock:
-                queue_status.pop(request.request_id, None)
+                queue_status.pop(seq, None)
             raise
         finally:
             # Published immediately (not just on the periodic interval) so
@@ -380,12 +405,17 @@ def build_ollama_payload(request: OllamaRequest) -> dict[str, Any]:
 
     return payload
 
-def stream_ollama_generate(request: OllamaRequest) -> dict[str, Any]:
+def stream_ollama_generate(request: OllamaRequest, seq: int | None = None) -> dict[str, Any]:
+    """seq is the caller's queue_status tracking key (None if the caller
+    isn't tracking queue progress for this call, e.g. direct unit tests) -
+    deliberately not request.request_id, which may repeat across requests
+    or be empty and so can't identify anything on its own."""
     payload = build_ollama_payload(request)
     body = json.dumps(payload).encode("utf-8")
 
     response_parts = []
     thinking_parts = []  # some reasoning models stream a separate "thinking" field
+    thinking_started = False  # latches once a "thinking" key is ever observed - not every model sends one
     final_meta: dict[str, Any] = {}
 
     start = time.monotonic()
@@ -432,14 +462,17 @@ def stream_ollama_generate(request: OllamaRequest) -> dict[str, Any]:
 
                 if chunk.get("response"):
                     response_parts.append(chunk["response"])
+                if "thinking" in chunk:
+                    thinking_started = True  # this model streams a thinking field, even if this chunk's is empty
                 if chunk.get("thinking"):
                     thinking_parts.append(chunk["thinking"])
 
-                update_queue_progress(
-                    request.request_id,
-                    response_chars=sum(len(p) for p in response_parts),
-                    thinking_chars=sum(len(p) for p in thinking_parts),
-                )
+                if seq is not None:
+                    update_queue_progress(
+                        seq,
+                        response_chars=sum(len(p) for p in response_parts),
+                        thinking_chars=sum(len(p) for p in thinking_parts) if thinking_started else -1,
+                    )
 
                 now = time.monotonic()
                 if now - last_progress_log >= 5.0:
@@ -484,29 +517,34 @@ def stream_ollama_generate(request: OllamaRequest) -> dict[str, Any]:
 def ollama_worker() -> None:
     log.info("Worker thread started")
     while True:
-        request = request_queue.get()  # blocks / waits if empty
+        item = request_queue.get()  # blocks / waits if empty
 
-        if request is SHUTDOWN_SENTINEL:
+        if item is SHUTDOWN_SENTINEL:
             log.info("Shutdown sentinel received, exiting worker loop")
             request_queue.task_done()
             break
 
+        seq, request = item  # seq is the queue_status tracking key, not request.request_id
+
         if shutdown_event.is_set():  # drain queue on shutdown
             log.info(f"Discarding queued request_id={request.request_id} due to shutdown")
             with queue_status_lock:
-                queue_status.pop(request.request_id, None)
+                queue_status.pop(seq, None)
             request_queue.task_done()
             continue
 
         with queue_status_lock:
-            entry = queue_status.get(request.request_id)
-            if entry is not None:  # dequeued: started, nothing generated yet
+            entry = queue_status.get(seq)
+            if entry is not None:  # dequeued: response generation started, nothing yet
                 entry["response_chars"] = 0
-                entry["thinking_chars"] = 0
+                # thinking_chars deliberately stays at -1 here: whether this
+                # request's model streams a "thinking" field at all is only
+                # known once (if ever) one actually shows up in a chunk, in
+                # stream_ollama_generate's thinking_started tracking below.
 
         try:
             log.info(f"Calling Ollama for request_id={request.request_id}")
-            result = stream_ollama_generate(request)
+            result = stream_ollama_generate(request, seq)
             log.info(f"Ollama response for {request.request_id}: {result}")
 
             publish_response(
@@ -524,7 +562,7 @@ def ollama_worker() -> None:
             handle_request_error(request.request_id, ErrorCode.OLLAMA_ERROR, f"unexpected error: {e}")
         finally:
             with queue_status_lock:
-                queue_status.pop(request.request_id, None)
+                queue_status.pop(seq, None)
             if not shutdown_event.is_set():
                 # Shutdown publishes its own final offline status right
                 # after this; skip the redundant online one mid-teardown.

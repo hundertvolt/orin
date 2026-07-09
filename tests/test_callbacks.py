@@ -119,7 +119,8 @@ def test_on_message_valid_request_is_queued(loaded_module):
     m.on_message(MagicMock(), None, _msg(payload))
 
     assert m.request_queue.qsize() == 1
-    queued = m.request_queue.get_nowait()
+    seq, queued = m.request_queue.get_nowait()
+    assert isinstance(seq, int)
     assert isinstance(queued, m.OllamaRequest)
     assert queued.request_id == "abc-123"
     assert queued.model == "llama3"
@@ -139,7 +140,7 @@ def test_on_message_optional_fields_pass_through(loaded_module):
 
     m.on_message(MagicMock(), None, _msg(payload))
 
-    queued = m.request_queue.get_nowait()
+    _seq, queued = m.request_queue.get_nowait()
     assert queued.to_ollama_options() == {"temperature": 0.5, "top_p": 0.9, "top_k": 40}
 
 
@@ -222,7 +223,9 @@ def test_on_message_registers_queue_status_entry_and_publishes_status(loaded_mod
 
     m.on_message(cli, None, _msg(payload))
 
-    assert m.queue_status["q-1"] == {"response_chars": -1, "thinking_chars": -1}
+    assert list(m.queue_status.values()) == [
+        {"request_id": "q-1", "response_chars": -1, "thinking_chars": -1}
+    ]
 
     cli.publish.assert_called_once()
     topic, published_payload = cli.publish.call_args.args
@@ -246,7 +249,7 @@ def test_on_message_rolls_back_queue_status_when_put_fails(loaded_module, monkey
 
     m.on_message(cli, None, _msg(payload))  # must not raise
 
-    assert "q-2" not in m.queue_status
+    assert m.queue_status == {}
     cli.publish.assert_called_once()
     body = json.loads(cli.publish.call_args.args[1])
     assert body["queue"] == []

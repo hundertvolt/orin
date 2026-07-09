@@ -79,12 +79,12 @@ The integration tests spin up a real local Mosquitto broker as a subprocess, so 
     "status": "online", "heartbeat": 1735689600,
     "queue": [
       {"request_id": "abc123", "response_chars": -1, "thinking_chars": -1},
-      {"request_id": "def456", "response_chars": 0, "thinking_chars": 0},
+      {"request_id": "def456", "response_chars": 0, "thinking_chars": -1},
       {"request_id": "ghi789", "response_chars": 42, "thinking_chars": 17}
     ]
   }
   ```
-  `queue` lists every request not yet fully processed, in the order it will be (or is being) processed. Each entry's `response_chars`/`thinking_chars` track that request's own generation progress independently (a "thinking" phase and a final-response phase can advance separately for reasoning models): `-1` queued but not yet started, `0` started but nothing generated yet for that field, otherwise the character count generated so far. `heartbeat` is `int(time.time())` at publish time, so a subscriber can tell a retained message apart from a live one.
+  `queue` lists every request not yet fully processed, in the order it will be (or is being) processed. Each entry's `response_chars`/`thinking_chars` track that request's own generation progress independently (a "thinking" phase and a final-response phase can advance separately for reasoning models). `response_chars` is `-1` queued but not yet started, `0` started but no response text generated yet, otherwise the response character count so far. `thinking_chars` follows the same `-1`/`0`/count shape, but since not every model streams a "thinking" field at all, `-1` also covers "no thinking activity observed for this request yet" - it only leaves `-1` once Ollama actually sends one (even an empty one, which reads as `0`), and simply stays `-1` for the whole request if the model never does. `heartbeat` is `int(time.time())` at publish time, so a subscriber can tell a retained message apart from a live one.
 
   Published on the same schedule as `mqtt_telemetry.py`'s telemetry (every `--interval` seconds), plus immediately whenever a request is enqueued or finishes (successfully, with an error, or cancelled by shutdown) - so a requestor can see their `request_id` land in the queue right away, or notice it disappear again without a normal `{topic}/response` reply (e.g. an error that pulled it back out before it ever ran).
 

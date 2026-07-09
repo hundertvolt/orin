@@ -279,16 +279,92 @@ def test_status_shows_queued_request_and_clears_after_completion(service_factory
         "request_id": "status-1", "model": "llama3", "system": "s", "user": "u",
     }), qos=1)
 
-    expected_entry = {"request_id": "status-1", "response_chars": -1, "thinking_chars": -1}
-    assert _wait_until(
-        lambda: any(json.loads(p)["queue"] == [expected_entry] for _, p, _ in received),
-        timeout=5,
-    ), f"never saw status-1 queued in a status message: {received}"
+    # response_chars may be observed as -1 (still queued) or 0 (worker already
+    # dequeued it) here - the fake Ollama backend responds fast enough that
+    # the worker can race this same enqueue-triggered publish and win, which
+    # is a real, harmless race (not a bug): the request genuinely was queued
+    # and is genuinely still unfinished either way. The invariant under test
+    # is that status-1 became visible promptly, not which sub-state we catch.
+    def saw_status_1_still_pending():
+        return any(
+            json.loads(p)["queue"] == [{"request_id": "status-1", "response_chars": chars, "thinking_chars": -1}]
+            for _, p, _ in received
+            for chars in (-1, 0)
+        )
+
+    assert _wait_until(saw_status_1_still_pending, timeout=5), \
+        f"never saw status-1 queued in a status message: {received}"
 
     assert _wait_until(
         lambda: bool(received) and json.loads(received[-1][1])["queue"] == [],
         timeout=5,
     ), f"queue never cleared after completion: {received}"
+
+
+def test_status_queue_shows_all_pending_requests_not_just_the_first(service_factory, probe_client, fake_ollama):
+    """Regression test for a live-system bug report: with a request
+    hanging mid-generation, several more queued behind it must all be
+    visible together in one status message's "queue" list - not just the
+    one currently being processed."""
+    fake_ollama.scenario = "hang"
+    fake_ollama.hang_seconds = 30
+    client, received = probe_client
+    client.subscribe("orin/ollama/status", qos=1)
+    time.sleep(0.3)
+
+    svc = service_factory(topic="orin/ollama", extra_args=["--interval", "2"])
+    assert svc.wait_for_log("Connected to MQTT broker"), svc.text()
+    assert _wait_until(lambda: len(received) >= 1), svc.text()  # initial online status
+    received.clear()
+
+    ids = [f"multi-{i}" for i in range(4)]
+    for request_id in ids:
+        client.publish("orin/ollama/request", json.dumps({
+            "request_id": request_id, "model": "llama3", "system": "s", "user": "u",
+        }), qos=1)
+        time.sleep(0.05)
+
+    def saw_all_four_pending_at_once():
+        return any(
+            {e["request_id"] for e in json.loads(p)["queue"]} == set(ids)
+            for _, p, _ in received
+        )
+
+    assert _wait_until(saw_all_four_pending_at_once, timeout=5), \
+        f"queue never showed all 4 pending requests together: {received}"
+
+
+def test_status_queue_handles_duplicate_request_ids_over_real_mqtt(service_factory, probe_client, fake_ollama):
+    """Exact reproduction of the reported live-system bug: the client
+    reused the same request_id for every queued request. request_id is an
+    arbitrary, caller-supplied label, never validated for uniqueness, so
+    the queue must still track each occurrence as its own entry - not
+    collapse them into one that then looks empty as soon as it finishes."""
+    fake_ollama.scenario = "hang"
+    fake_ollama.hang_seconds = 30
+    client, received = probe_client
+    client.subscribe("orin/ollama/status", qos=1)
+    time.sleep(0.3)
+
+    svc = service_factory(topic="orin/ollama", extra_args=["--interval", "2"])
+    assert svc.wait_for_log("Connected to MQTT broker"), svc.text()
+    assert _wait_until(lambda: len(received) >= 1), svc.text()  # initial online status
+    received.clear()
+
+    for _ in range(3):
+        client.publish("orin/ollama/request", json.dumps({
+            "request_id": "same-id", "model": "llama3", "system": "s", "user": "u",
+        }), qos=1)
+        time.sleep(0.05)
+
+    def saw_all_three_duplicate_ids_pending_at_once():
+        return any(
+            len(json.loads(p)["queue"]) == 3 and all(e["request_id"] == "same-id" for e in json.loads(p)["queue"])
+            for _, p, _ in received
+        )
+
+    assert _wait_until(saw_all_three_duplicate_ids_pending_at_once, timeout=5), \
+        f"queue collapsed same-ID requests instead of tracking each independently: {received}"
 
 
 def test_status_publishes_periodically(service_factory, probe_client):

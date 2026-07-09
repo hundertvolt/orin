@@ -256,7 +256,7 @@ class _OllamaHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
             self.end_headers()
-            self.wfile.write((json.dumps({"response": "partial-"}) + "\n").encode())
+            self.wfile.write((json.dumps(self.server.chunks[0]) + "\n").encode())
             self.wfile.flush()
             time.sleep(self.server.hang_seconds)
             return
