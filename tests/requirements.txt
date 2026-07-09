@@ -1,9 +1,0 @@
-pytest
-pytest-timeout
-paho-mqtt
-pydantic
-
-# Integration tests in test_integration.py also require a `mosquitto`
-# binary on PATH (e.g. `apt install mosquitto` on Debian/Ubuntu/Jetson).
-# They start and stop it themselves as a subprocess; nothing needs to
-# be running beforehand.
