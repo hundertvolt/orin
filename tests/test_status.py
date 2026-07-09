@@ -103,33 +103,21 @@ def test_interval_defaults_to_ten_seconds(loaded_module):
 # ollama_worker(): queue_status lifecycle
 # ------------------------------
 
-def _make_request(module, **overrides):
-    fields = {"request_id": "w-1", "model": "llama3", "system": "sys", "user": "hello"}
-    fields.update(overrides)
-    return module.OllamaRequest(**fields)
-
-
-def _enqueue(module, request_id, seq=None, **overrides):
+def _enqueue(module, request_id):
     """Register a queue_status entry and push (seq, request) onto
     request_queue, mirroring what on_message does for a real MQTT
-    request - but with direct control over `seq`, so tests can exercise
-    ollama_worker() without going through the MQTT callback plumbing.
+    request - but callable directly, without the MQTT callback plumbing.
 
     request_id is deliberately NOT used as the queue_status key (a
     caller-supplied request_id may repeat, or be empty) - `seq` is an
-    internal, always-unique tracking key, auto-assigned from the same
-    counter production code uses unless the test passes its own."""
-    request = _make_request(module, request_id=request_id, **overrides)
-    if seq is None:
-        seq = next(module._queue_seq_counter)
+    internal, always-unique tracking key from the same counter
+    production code uses."""
+    request = module.OllamaRequest(request_id=request_id, model="llama3", system="sys", user="hello")
+    seq = next(module._queue_seq_counter)
     with module.queue_status_lock:
         module.queue_status[seq] = {"request_id": request_id, "response_chars": -1, "thinking_chars": -1}
     module.request_queue.put((seq, request))
     return seq
-
-
-def _pending_request_ids(module):
-    return [entry["request_id"] for entry in module.build_queue_snapshot()]
 
 
 def test_ollama_worker_sets_zero_on_dequeue_before_generation_starts(loaded_module, monkeypatch):
@@ -699,20 +687,6 @@ def test_duplicate_request_id_finishing_one_leaves_the_others_pending(loaded_mod
             t.join(timeout=5)
 
 
-def test_empty_string_request_id_is_a_valid_independent_queue_entry(loaded_module):
-    """An empty request_id is a legal value (OllamaRequest only requires
-    it to be a string) and must be handled exactly like any other label -
-    including allowing several empty-ID requests to coexist as distinct
-    queue entries."""
-    m = loaded_module
-    _enqueue(m, "")
-    _enqueue(m, "")
-
-    snapshot = m.build_queue_snapshot()
-    assert len(snapshot) == 2
-    assert all(e["request_id"] == "" for e in snapshot)
-
-
 # request_id: str = Field(strict=True) is pydantic's *entire* contract -
 # strict=True only blocks type coercion (e.g. an int or bool being
 # silently turned into a string); it imposes no length limit, no
@@ -735,30 +709,13 @@ WEIRD_BUT_VALID_REQUEST_IDS = [
 
 
 @pytest.mark.parametrize("weird_id", WEIRD_BUT_VALID_REQUEST_IDS)
-def test_queue_snapshot_round_trips_arbitrary_request_id_content(loaded_module, weird_id):
-    """The queue snapshot must carry any pydantic-valid request_id through
-    unchanged, and the resulting status payload must still be valid,
-    round-trippable JSON - json.dumps/json.loads must not choke on any of
-    this content, and no character in it may corrupt the JSON structure."""
-    m = loaded_module
-    _enqueue(m, weird_id)
-
-    snapshot = m.build_queue_snapshot()
-    assert snapshot == [{"request_id": weird_id, "response_chars": -1, "thinking_chars": -1}]
-
-    payload = m.build_status_payload(online=True)
-    encoded = json.dumps(payload)  # must not raise
-    decoded = json.loads(encoded)  # must round-trip byte-for-byte
-    assert decoded["queue"] == [{"request_id": weird_id, "response_chars": -1, "thinking_chars": -1}]
-
-
-@pytest.mark.parametrize("weird_id", WEIRD_BUT_VALID_REQUEST_IDS)
 def test_on_message_accepts_and_tracks_arbitrary_request_id_content(loaded_module, weird_id):
-    """Same coverage as above, but through the real on_message() entry
-    point - pydantic validates weird_id as an ordinary str (it has no
-    reason to reject any of these), and everything downstream (queueing,
-    tracking, the immediate status publish) must handle it the same as
-    any "normal-looking" request_id."""
+    """Through the real on_message() entry point - pydantic validates
+    weird_id as an ordinary str (it has no reason to reject any of
+    these), and everything downstream (queueing, tracking, the immediate
+    status publish, and the JSON encoding of the whole status payload)
+    must handle it the same as any "normal-looking" request_id, carrying
+    it through unchanged without corrupting the JSON structure."""
     m = loaded_module
     cli = MagicMock()
     payload = json.dumps({

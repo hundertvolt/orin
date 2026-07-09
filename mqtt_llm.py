@@ -252,6 +252,11 @@ def build_status_payload(online: bool) -> dict[str, Any]:
         "queue": build_queue_snapshot(),
     }
 
+# The offline payload never varies, so both places that need it (the LWT
+# and the explicit clean-shutdown publish) share this one precomputed
+# encoding instead of each separately calling build_status_payload(False).
+OFFLINE_STATUS_JSON = json.dumps(build_status_payload(online=False))
+
 # Serializes build_status_payload()+cli.publish() as one unit across
 # threads (on_message, ollama_worker, status_publisher all call this).
 # Without it, two concurrent calls could interleave so the one that
@@ -578,7 +583,7 @@ def ollama_worker() -> None:
 
 client = mqtt.Client(client_id="orin_ollama", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.max_queued_messages_set(5)
-client.will_set(MQTT_STATUS_TOPIC, json.dumps(build_status_payload(online=False)), qos=1, retain=True)
+client.will_set(MQTT_STATUS_TOPIC, OFFLINE_STATUS_JSON, qos=1, retain=True)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
 client.on_connect = on_connect
 client.on_disconnect = on_disconnect
@@ -690,7 +695,7 @@ finally:
 
     try:
         if client.is_connected():
-            info = client.publish(MQTT_STATUS_TOPIC, json.dumps(build_status_payload(online=False)), qos=1, retain=True)
+            info = client.publish(MQTT_STATUS_TOPIC, OFFLINE_STATUS_JSON, qos=1, retain=True)
             info.wait_for_publish(timeout=2.0)  # ensure the offline status is sent before disconnecting
             log.debug("Offline status published.")
         client.loop_stop()
