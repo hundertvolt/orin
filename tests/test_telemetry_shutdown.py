@@ -376,3 +376,85 @@ def test_jtop_is_actually_invoked_during_load():
         jtop_stats=BASELINE_JTOP_STATS, jtop_fan=BASELINE_JTOP_FAN,
     )
     assert m.jtop_enter_count == 1
+
+
+# ------------------------------
+# jtop retry backoff
+# ------------------------------
+
+def test_jtop_retry_delay_backs_off_and_caps(caplog):
+    """Repeated jtop failures must not all retry at the same short
+    interval - a fresh jtop() instance costs real work upstream (see
+    _close_jtop_in_background's docstring in mqtt_telemetry.py), so
+    hammering it every JTOP_RETRY_DELAY_MIN for the length of a whole
+    system update would pile up far more of that work than a longer
+    outage warrants. The delay must double on each consecutive failure
+    and stop growing once it hits JTOP_RETRY_DELAY_MAX."""
+    caplog.set_level("INFO")
+    m = load_mqtt_telemetry(
+        ["--broker", "127.0.0.1"],
+        jtop_enter_error=RuntimeError("jetson_stats service is not running (simulated)"),
+        sleep_calls_before_exit=6,
+    )  # must not raise
+
+    assert m.jtop_enter_count == 6
+    assert m.sleep_durations == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
+
+
+def test_jtop_retry_delay_resets_after_a_successful_open(caplog):
+    """A later success must reset the backoff - a brief blip right after
+    a long outage shouldn't inherit that outage's slow retry cadence."""
+    caplog.set_level("INFO")
+    m = load_mqtt_telemetry(
+        ["--broker", "127.0.0.1"],
+        jtop_stats=BASELINE_JTOP_STATS, jtop_fan=BASELINE_JTOP_FAN,
+        jtop_enter_error=RuntimeError("jetson_stats service is not running (simulated)"),
+        jtop_enter_error_times=2,  # first two opens fail, third succeeds
+        jtop_ok_error=RuntimeError("Lost connection with jtop server (simulated)"),
+        jtop_ok_error_after=0,  # ...then immediately fails again, before any publish
+        sleep_calls_before_exit=3,
+    )  # must not raise
+
+    assert m.jtop_enter_count == 3
+    # 5.0 -> 10.0 backing off across the first two failures, then back
+    # down to 5.0 after the third instance opened successfully - not
+    # 20.0, which is what continuing the backoff would have produced.
+    assert m.sleep_durations == [5.0, 10.0, 5.0]
+
+
+# ------------------------------
+# jtop close() must never block recovery or shutdown
+# ------------------------------
+
+def test_close_does_not_block_retry_or_shutdown(caplog):
+    """The real jtop's close() can hang indefinitely - it joins an
+    internal thread that shells out to `dpkg -l` with no timeout of its
+    own, and dpkg can be locked for the length of a whole system update
+    (see _close_jtop_in_background's docstring in mqtt_telemetry.py).
+    Closing a discarded jtop instance must never be able to stall
+    recovery or shutdown, so it has to run in the background rather than
+    be waited on - this proves it by making close() hang for the
+    duration of the test and confirming the module still finishes
+    promptly anyway."""
+    caplog.set_level("DEBUG")
+    close_gate = threading.Lock()
+    close_gate.acquire()
+    try:
+        m = load_mqtt_telemetry(
+            ["--broker", "127.0.0.1", "--loglevel", "DEBUG"],
+            jtop_stats=BASELINE_JTOP_STATS, jtop_fan=BASELINE_JTOP_FAN,
+            jtop_ok_error=RuntimeError("Lost connection with jtop server (simulated)"),
+            jtop_ok_error_after=0,
+            jtop_close_blocks_on=close_gate,
+            sleep_calls_before_exit=1,
+        )  # must return promptly despite close() being stuck on close_gate
+
+        assert "jtop error, retrying" in caplog.text
+        assert "Shutdown complete." in caplog.text
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and m.jtop_close_count["n"] < 1:
+            time.sleep(0.02)
+        assert m.jtop_close_count["n"] >= 1, "close() was never attempted"
+    finally:
+        close_gate.release()  # let the still-pending background close() finish

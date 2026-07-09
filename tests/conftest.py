@@ -361,15 +361,19 @@ class RaisingFakeJetson:
         return {}
 
 
-def _install_fake_jtop(stats=None, fan=None, enter_error=None, enter_error_times=None, ok_error=None, ok_error_after=0):
+def _install_fake_jtop(
+    stats=None, fan=None, enter_error=None, enter_error_times=None, ok_error=None, ok_error_after=0, close_blocks_on=None
+):
     """Install a minimal fake `jtop` module into sys.modules.
 
     mqtt_telemetry.py does `from jtop import jtop`; the real jetson-stats
     package needs actual Jetson hardware and the jetson_stats service, so
     it isn't usable here. This fakes just the shape the script relies on:
-    a context manager exposing .ok()/.stats/.fan/.close(). Returns a dict
-    tracking how many times __enter__ was called, so tests can confirm
-    jtop() was actually invoked (and how many times, across retries).
+    a context manager exposing .ok()/.stats/.fan/.close(). Returns
+    (enter_count, close_count): dicts tracking how many times
+    __enter__()/close() were actually invoked, so tests can confirm jtop
+    was really used (and how many times, across retries) without relying
+    on timing.
 
     enter_error, given alone, raises on every __enter__() call - an
     outage that never clears, for testing that the caller keeps retrying
@@ -384,8 +388,22 @@ def _install_fake_jtop(stats=None, fan=None, enter_error=None, enter_error_times
     call counter is per-instance, not global, since a fresh jtop()
     instance after a retry has its own, initially-healthy state in the
     real client too.
+
+    close_blocks_on, given a threading.Lock the caller has already
+    acquired, makes close() block trying to acquire it too, until the
+    caller releases it - for testing that a slow/stuck close() (the real
+    jtop's close() can hang shelling out to dpkg with no timeout of its
+    own, see _close_jtop_in_background's docstring in mqtt_telemetry.py)
+    never blocks the retry loop, since production code is meant to run it
+    in a background thread rather than wait on it. A plain Lock is used
+    rather than a threading.Event because load_mqtt_telemetry() patches
+    threading.Event.wait globally for the duration of the module's
+    execution (see below) - that patch would silently make an
+    Event-based gate return immediately regardless of state, defeating
+    the point here. Lock.acquire() isn't touched by that patch.
     """
     enter_count = {"n": 0}
+    close_count = {"n": 0}
 
     class FakeJtopContextManager:
         def __init__(self):
@@ -407,7 +425,10 @@ def _install_fake_jtop(stats=None, fan=None, enter_error=None, enter_error_times
             return True
 
         def close(self):
-            pass
+            close_count["n"] += 1
+            if close_blocks_on is not None:
+                close_blocks_on.acquire()
+                close_blocks_on.release()
 
         @property
         def stats(self):
@@ -420,7 +441,7 @@ def _install_fake_jtop(stats=None, fan=None, enter_error=None, enter_error_times
     fake_module = types.ModuleType("jtop")
     fake_module.jtop = FakeJtopContextManager
     sys.modules["jtop"] = fake_module
-    return enter_count
+    return enter_count, close_count
 
 
 def load_mqtt_telemetry(
@@ -432,6 +453,7 @@ def load_mqtt_telemetry(
     jtop_enter_error_times=None,
     jtop_ok_error=None,
     jtop_ok_error_after=0,
+    jtop_close_blocks_on=None,
     sleep_calls_before_exit=1,
 ):
     """Load a fresh, isolated instance of mqtt_telemetry.py for testing.
@@ -481,17 +503,19 @@ def load_mqtt_telemetry(
     mqtt_telemetry.py's main loop now retries a jtop() failure - whether
     at open or mid-run - rather than propagating it, so either of these
     by itself no longer crashes the module; it just makes the module log
-    and retry, same as any other jtop outage.
+    and retry, same as any other jtop outage. jtop_close_blocks_on is
+    passed straight through to _install_fake_jtop - see there.
     """
     mocks = dict(client_method_mocks or {})
     mocks.setdefault("connect", MagicMock(return_value=None))
     mocks.setdefault("loop_start", MagicMock(return_value=None))
     mocks.setdefault("is_connected", MagicMock(return_value=True))
 
-    enter_count = _install_fake_jtop(
+    enter_count, close_count = _install_fake_jtop(
         stats=jtop_stats, fan=jtop_fan,
         enter_error=jtop_enter_error, enter_error_times=jtop_enter_error_times,
         ok_error=jtop_ok_error, ok_error_after=jtop_ok_error_after,
+        close_blocks_on=jtop_close_blocks_on,
     )
 
     mod_name = f"mqtt_telemetry_under_test_{next(_telemetry_module_counter)}"
@@ -501,9 +525,11 @@ def load_mqtt_telemetry(
     exec_errors = []
 
     sleep_calls = {"n": 0}
+    sleep_durations = []
 
     def fake_sleep(seconds):
         sleep_calls["n"] += 1
+        sleep_durations.append(seconds)
         if sleep_calls["n"] >= sleep_calls_before_exit:
             raise SystemExit
 
@@ -531,6 +557,15 @@ def load_mqtt_telemetry(
         raise exec_errors[0]
 
     module.jtop_enter_count = enter_count["n"]
+    # Unlike enter_count, this is exposed as the live dict, not a frozen
+    # int snapshot: close() may genuinely still be running on its own
+    # background thread after this function returns (see
+    # _close_jtop_in_background in mqtt_telemetry.py) - a snapshot taken
+    # here could read 0 forever even once close() does eventually run.
+    # Callers that care about a close() that's still in flight should
+    # poll module.jtop_close_count["n"].
+    module.jtop_close_count = close_count
+    module.sleep_durations = sleep_durations
     return module
 
 

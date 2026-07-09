@@ -72,24 +72,36 @@ one of them, stop and reconsider rather than routing around it:
   failure (refused, reset, timeout, bad data) just fails that one request
   and the worker loop moves on. In `mqtt_telemetry.py`, `jtop()` failing to
   open *and* jtop breaking mid-run are handled identically — discard
-  whatever jtop state exists and retry a fresh `jtop()` instance after
-  `JTOP_RETRY_DELAY`, rather than distinguishing "never connected" from
-  "connection broke". **Read `jtop.py` upstream (jetson-stats on PyPI, pure
-  Python, `pip download jetson-stats` works off-device) before changing this
-  path** — it's not what it looks like: `jetson.stats`/`.fan` are plain
-  in-memory reads with zero I/O (they cannot hang), but they also never
-  raise for a lost connection — jtop's background reader thread catches
-  that internally and only surfaces it if the caller calls `jetson.ok()`.
-  `publish_telemetry()` calls `jetson.ok(spin=True)` specifically for this;
-  removing it silently brings back "stale data forever, no error, no retry"
-  for any mid-run outage. Also note `jtop.__exit__` does **not** stop the
-  background thread or close the connection — the retry loop calls
-  `jetsonTop.close()` itself in a `finally`, or every retry attempt leaks
-  one. A jtop/Ollama outage is also reported on the telemetry/status
-  payload itself (`status: "offline"`, real non-zero `heartbeat`, sensor
-  fields `null` for jtop) so subscribers see the degradation live, distinct
-  from the `heartbeat: 0` LWT/shutdown message which means the process
-  itself is gone.
+  whatever jtop state exists and retry a fresh `jtop()` instance after a
+  backoff delay (`JTOP_RETRY_DELAY_MIN` doubling to `JTOP_RETRY_DELAY_MAX`,
+  reset once an open succeeds), rather than distinguishing "never
+  connected" from "connection broke". A jtop/Ollama outage is also reported
+  on the telemetry/status payload itself (`status: "offline"`, real
+  non-zero `heartbeat`, sensor fields `null` for jtop) so subscribers see
+  the degradation live, distinct from the `heartbeat: 0` LWT/shutdown
+  message which means the process itself is gone.
+
+  **Read `jtop.py` upstream (jetson-stats on PyPI, pure Python, `pip
+  download jetson-stats` works off-device) before changing any of this** —
+  its behavior isn't what it looks like, twice over:
+  - `jetson.stats`/`.fan` are plain in-memory reads with zero I/O (they
+    cannot hang), but they also never raise for a lost connection — jtop's
+    background reader thread catches that internally and only surfaces it
+    if the caller calls `jetson.ok()`. `publish_telemetry()` calls
+    `jetson.ok(spin=True)` specifically for this; removing it silently
+    brings back "stale data forever, no error, no retry" for any mid-run
+    outage.
+  - `jtop.__exit__` does **not** stop the background thread or close the
+    connection — the retry loop calls `jetsonTop.close()` itself, or every
+    retry attempt leaks one. But `close()` joins an internal thread that
+    shells out to `dpkg -l`/`nvcc`/`opencv_version` with *no timeout of its
+    own* (`jtop.core.command.Command.__call__` defaults to blocking
+    forever) — and `dpkg` can be locked for the length of a whole system
+    update, exactly the scenario this retry loop exists to survive. So
+    `close()` is never called synchronously; `_close_jtop_in_background()`
+    fires it in its own daemon thread, best-effort, so a stuck close can
+    only delay that one instance's cleanup, never recovery or shutdown.
+    Don't "simplify" this back to an inline `jetsonTop.close()` call.
 
 If you extend either script, keep new code inside these same invariants
 (caught-and-logged callback errors, explicit offline publish on clean exit,

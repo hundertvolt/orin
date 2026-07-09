@@ -272,12 +272,39 @@ def publish_offline_telemetry() -> None:
 # Main loop using jtop
 # ------------------------------
 
-JTOP_RETRY_DELAY = 5.0  # seconds to wait before retrying after a jtop failure
+JTOP_RETRY_DELAY_MIN = 5.0   # initial delay before retrying after a jtop failure
+JTOP_RETRY_DELAY_MAX = 60.0  # cap for the backoff below, reached after repeated failures
+
+
+def _close_jtop_in_background(jetson: jtop) -> None:
+    """Close a discarded jtop instance without blocking the retry loop on it.
+
+    jtop's own __exit__ doesn't stop its background reader thread or
+    close its connection to the service - close() does, but it joins an
+    internal thread that shells out to `dpkg -l`/nvcc/opencv_version with
+    no timeout of its own (see jtop.core.command.Command.__call__,
+    jtop.core.jetson_libraries.get_all_modules). dpkg can be locked for
+    the duration of a system update - precisely the kind of outage this
+    retry loop exists to survive - so calling close() synchronously here
+    could turn "jtop is being updated" into "the service is stuck
+    forever," the opposite of what the retry loop is for. Running it in
+    its own daemon thread instead means a slow/stuck close() only delays
+    that one instance's cleanup, never recovery or shutdown.
+    """
+    def run() -> None:
+        try:
+            jetson.close()
+        except Exception as e:
+            log.warning(f"Error closing jtop: {e}")
+
+    threading.Thread(target=run, name="jtop-close", daemon=True).start()
+
 
 try:
     wait_for_mqtt_connection()
     log.info(f"Telemetry service started using topic: {MQTT_TOPIC}.")
 
+    retry_delay = JTOP_RETRY_DELAY_MIN
     while True:
         # jtop() failing to open and jtop failing mid-run (an exception
         # raised out of publish_telemetry's ok()/stats/.fan access) are
@@ -291,22 +318,23 @@ try:
         try:
             with jtop() as jetsonTop:
                 log.info("Connected to jtop.")
+                retry_delay = JTOP_RETRY_DELAY_MIN  # reachable again - reset the backoff
                 try:
                     while True:
                         publish_telemetry(jetsonTop)
                         time.sleep(PUBLISH_INTERVAL)
                 finally:
-                    # jtop's own __exit__ doesn't stop its background reader
-                    # thread or close its connection to the service - without
-                    # this, every retry attempt here would leak one of each.
-                    try:
-                        jetsonTop.close()
-                    except Exception as close_err:
-                        log.warning(f"Error closing jtop: {close_err}")
+                    _close_jtop_in_background(jetsonTop)
         except Exception as e:
-            log.error(f"jtop error, retrying in {JTOP_RETRY_DELAY}s: {e}")
+            log.error(f"jtop error, retrying in {retry_delay:.0f}s: {e}")
             publish_offline_telemetry()
-            time.sleep(JTOP_RETRY_DELAY)
+            time.sleep(retry_delay)
+            # Back off on repeated failures: a fresh jtop() instance isn't
+            # free (see _close_jtop_in_background) and retrying it every
+            # JTOP_RETRY_DELAY_MIN for the length of a whole system update
+            # would pile up far more of that work than a longer outage
+            # warrants.
+            retry_delay = min(retry_delay * 2, JTOP_RETRY_DELAY_MAX)
 
 except SystemExit:
     log.debug("SystemExit received, stopping main loop.")
