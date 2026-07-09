@@ -107,7 +107,7 @@ Published to `{topic}` (qos 1) on every interval, and once more (qos 1, retained
 }
 ```
 
-Any field is `null` if the corresponding sensor/stat isn't available.
+Any field is `null` if the corresponding sensor/stat isn't available. If jtop itself is unavailable (e.g. the `jetson_stats` service restarting for an update), that's reported the same way, live on `{topic}` with `status: "offline"` and every sensor field `null` - but with a real, current `heartbeat`, distinguishing "process alive, sensors degraded" from the `heartbeat: 0` shutdown/LWT message. The service retries in the background on its own and flips back to `status: "online"` once jtop recovers - no restart needed.
 
 </details>
 

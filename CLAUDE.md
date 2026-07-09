@@ -62,10 +62,39 @@ one of them, stop and reconsider rather than routing around it:
   `_positive_int`/`_positive_float`), not deep in the code — bad input
   should fail immediately and clearly at startup, not surface later as an
   unrelated exception (e.g. `time.sleep()` raising on a negative interval).
+- **A dependency outage retries in-process; it does not crash the service.**
+  Both scripts treat "Ollama/jtop is temporarily unavailable" as an expected,
+  self-clearing condition, not a reason to let systemd restart the whole
+  process — a full restart is the last-resort fallback for genuinely
+  unexpected bugs, not the intended recovery path for a dependency bouncing
+  during an update. In `mqtt_llm.py` this falls out naturally: a fresh
+  `http.client.HTTPConnection` is created per request, so every Ollama
+  failure (refused, reset, timeout, bad data) just fails that one request
+  and the worker loop moves on. In `mqtt_telemetry.py`, `jtop()` failing to
+  open *and* jtop breaking mid-run are handled identically — discard
+  whatever jtop state exists and retry a fresh `jtop()` instance after
+  `JTOP_RETRY_DELAY`, rather than distinguishing "never connected" from
+  "connection broke". **Read `jtop.py` upstream (jetson-stats on PyPI, pure
+  Python, `pip download jetson-stats` works off-device) before changing this
+  path** — it's not what it looks like: `jetson.stats`/`.fan` are plain
+  in-memory reads with zero I/O (they cannot hang), but they also never
+  raise for a lost connection — jtop's background reader thread catches
+  that internally and only surfaces it if the caller calls `jetson.ok()`.
+  `publish_telemetry()` calls `jetson.ok(spin=True)` specifically for this;
+  removing it silently brings back "stale data forever, no error, no retry"
+  for any mid-run outage. Also note `jtop.__exit__` does **not** stop the
+  background thread or close the connection — the retry loop calls
+  `jetsonTop.close()` itself in a `finally`, or every retry attempt leaks
+  one. A jtop/Ollama outage is also reported on the telemetry/status
+  payload itself (`status: "offline"`, real non-zero `heartbeat`, sensor
+  fields `null` for jtop) so subscribers see the degradation live, distinct
+  from the `heartbeat: 0` LWT/shutdown message which means the process
+  itself is gone.
 
 If you extend either script, keep new code inside these same invariants
 (caught-and-logged callback errors, explicit offline publish on clean exit,
-event-based waits instead of polling, fail-fast CLI validation).
+event-based waits instead of polling, fail-fast CLI validation, retry
+dependency outages in-process rather than crashing).
 
 ## Code style
 

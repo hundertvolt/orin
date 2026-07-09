@@ -1,12 +1,14 @@
 """
 Unit tests for publish_telemetry()'s payload generation and publish
 behavior: connected/not-connected gating, missing/partial jtop stats,
-the -256 "sensor absent" sentinel, and that nothing inside can escape
-and crash the main loop.
+the -256 "sensor absent" sentinel, that a jtop-side failure propagates
+(for the main loop's retry wrapper to catch) while an MQTT-side failure
+is contained locally instead.
 """
 import json
 from unittest.mock import MagicMock
 
+import pytest
 from conftest import BASELINE_JTOP_FAN, BASELINE_JTOP_STATS, FakeJetson, RaisingFakeJetson
 
 
@@ -142,18 +144,44 @@ def test_publish_error_code_is_logged_without_crashing(loaded_telemetry_module, 
     assert "Publish returned error code" in caplog.text
 
 
-def test_stats_access_exception_is_contained(loaded_telemetry_module, monkeypatch, caplog):
-    """If the jtop backend itself misbehaves (e.g. stats access raises),
-    the whole main loop must not go down with it."""
+def test_ok_is_actually_called(loaded_telemetry_module, monkeypatch):
+    """Regression guard: publish_telemetry() must call jetson.ok() on
+    every publish, not just read .stats/.fan directly - ok() is the only
+    thing that can surface a lost jtop connection (see
+    test_ok_check_exception_propagates_for_retry). A future refactor that
+    drops this call would silently bring back "stale data forever, no
+    error, no retry" for a mid-run outage."""
+    m = loaded_telemetry_module
+    client = MagicMock()
+    client.publish.return_value = MagicMock(rc=0)
+    client.is_connected.return_value = True
+    monkeypatch.setattr(m, "client", client)
+
+    jetson = FakeJetson(BASELINE_JTOP_STATS, BASELINE_JTOP_FAN)
+    ok = MagicMock(wraps=jetson.ok)
+    monkeypatch.setattr(jetson, "ok", ok)
+
+    m.publish_telemetry(jetson)
+
+    ok.assert_called_once_with(spin=True)
+
+
+def test_ok_check_exception_propagates_for_retry(loaded_telemetry_module, monkeypatch):
+    """A lost jtop connection is only ever surfaced through ok() - the
+    real client's background reader thread catches it internally and
+    .stats/.fan themselves just keep returning the last-synced snapshot
+    with no error (see jtop.py upstream). publish_telemetry() must call
+    ok() and let it propagate rather than swallow it, so the main loop's
+    jtop retry wrapper can catch it and open a fresh jtop() instance."""
     m = loaded_telemetry_module
     client = MagicMock()
     client.is_connected.return_value = True
     monkeypatch.setattr(m, "client", client)
 
-    m.publish_telemetry(RaisingFakeJetson(RuntimeError("jtop backend crashed")))  # must not raise
+    with pytest.raises(RuntimeError, match="jtop backend crashed"):
+        m.publish_telemetry(RaisingFakeJetson(RuntimeError("jtop backend crashed")))
 
     client.publish.assert_not_called()
-    assert "Telemetry publish error" in caplog.text
 
 
 def test_publish_call_itself_raising_is_contained(loaded_telemetry_module, monkeypatch, caplog):

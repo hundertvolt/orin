@@ -307,11 +307,22 @@ BASELINE_JTOP_FAN = {"pwmfan": {"speed": [60], "rpm": [1500]}}
 
 
 class FakeJetson:
-    """Stand-in for a jtop instance, for calling publish_telemetry() directly."""
+    """Stand-in for a jtop instance, for calling publish_telemetry() directly.
+
+    ok()/close() are no-ops here, matching the real jtop client's shape:
+    ok() is what actually surfaces a lost connection (see
+    RaisingFakeJetson), not .stats/.fan themselves.
+    """
 
     def __init__(self, stats=None, fan=None):
         self._stats = stats if stats is not None else {}
         self._fan = fan if fan is not None else {}
+
+    def ok(self, spin=False):
+        return True
+
+    def close(self):
+        pass
 
     @property
     def stats(self):
@@ -323,41 +334,80 @@ class FakeJetson:
 
 
 class RaisingFakeJetson:
-    """A jtop stand-in whose .stats access fails, for exception-path tests."""
+    """A jtop stand-in whose .ok() fails, for exception-path tests.
+
+    This mirrors the real jtop client: a lost connection is detected by
+    its background reader thread, stored, and only surfaced when the
+    caller calls ok() - .stats/.fan themselves are plain in-memory reads
+    that never raise for a connectivity reason (see jtop.py upstream,
+    jtop.ok()/jtop._get_data()).
+    """
 
     def __init__(self, error):
         self._error = error
 
+    def ok(self, spin=False):
+        raise self._error
+
+    def close(self):
+        pass
+
     @property
     def stats(self):
-        raise self._error
+        return {}
 
     @property
     def fan(self):
         return {}
 
 
-def _install_fake_jtop(stats=None, fan=None, enter_error=None):
+def _install_fake_jtop(stats=None, fan=None, enter_error=None, enter_error_times=None, ok_error=None, ok_error_after=0):
     """Install a minimal fake `jtop` module into sys.modules.
 
     mqtt_telemetry.py does `from jtop import jtop`; the real jetson-stats
     package needs actual Jetson hardware and the jetson_stats service, so
     it isn't usable here. This fakes just the shape the script relies on:
-    a context manager exposing .stats / .fan. Returns a dict tracking how
-    many times __enter__ was called, so tests can confirm jtop() was
-    actually invoked.
+    a context manager exposing .ok()/.stats/.fan/.close(). Returns a dict
+    tracking how many times __enter__ was called, so tests can confirm
+    jtop() was actually invoked (and how many times, across retries).
+
+    enter_error, given alone, raises on every __enter__() call - an
+    outage that never clears, for testing that the caller keeps retrying
+    instead of crashing. Pass enter_error_times as well to only raise for
+    that many attempts and then succeed normally, for testing that a
+    later retry actually recovers.
+
+    ok_error, given, makes ok(spin=True) raise it once it's been called
+    more than ok_error_after times *on a given fake jtop instance* - a
+    mid-run failure after some number of successful publishes, matching
+    the real client's failure-detection path (see RaisingFakeJetson). The
+    call counter is per-instance, not global, since a fresh jtop()
+    instance after a retry has its own, initially-healthy state in the
+    real client too.
     """
     enter_count = {"n": 0}
 
     class FakeJtopContextManager:
+        def __init__(self):
+            self._ok_calls = 0
+
         def __enter__(self):
             enter_count["n"] += 1
-            if enter_error is not None:
+            if enter_error is not None and (enter_error_times is None or enter_count["n"] <= enter_error_times):
                 raise enter_error
             return self
 
         def __exit__(self, exc_type, exc, tb):
             return False
+
+        def ok(self, spin=False):
+            self._ok_calls += 1
+            if ok_error is not None and self._ok_calls > ok_error_after:
+                raise ok_error
+            return True
+
+        def close(self):
+            pass
 
         @property
         def stats(self):
@@ -373,19 +423,34 @@ def _install_fake_jtop(stats=None, fan=None, enter_error=None):
     return enter_count
 
 
-def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fan=None, jtop_enter_error=None):
+def load_mqtt_telemetry(
+    argv,
+    client_method_mocks=None,
+    jtop_stats=None,
+    jtop_fan=None,
+    jtop_enter_error=None,
+    jtop_enter_error_times=None,
+    jtop_ok_error=None,
+    jtop_ok_error_after=0,
+    sleep_calls_before_exit=1,
+):
     """Load a fresh, isolated instance of mqtt_telemetry.py for testing.
 
     Mirrors load_mqtt_llm(): connect()/loop_start() are stubbed,
     signal.signal() is stubbed, and exec_module() runs on a background
     thread. mqtt_telemetry.py has no shutdown_event to trigger
-    externally - instead its main loop blocks in
-    time.sleep(PUBLISH_INTERVAL) between publishes, so time.sleep is
-    patched to raise SystemExit on its first call: the same effect
-    handle_exit() has in production when a signal arrives during that
-    sleep. That lets the module publish once for real (against the fake
-    jtop given here) and then run its own shutdown/cleanup code, exactly
-    like a real SIGTERM would.
+    externally - instead its main loop blocks in time.sleep() (either
+    between publishes, or between jtop retry attempts), so time.sleep is
+    patched to raise SystemExit once it's been called
+    sleep_calls_before_exit times: the same effect handle_exit() has in
+    production when a signal arrives during one of those sleeps. With
+    the default of 1, that's the very first sleep - letting the module
+    publish once for real (against the fake jtop given here) and then
+    run its own shutdown/cleanup code, exactly like a real SIGTERM
+    would. Pass a higher value to let the module run through more
+    sleeps for real first (e.g. surviving one jtop retry delay before
+    the module is asked to shut down), for tests that need to observe
+    what happens after a retry, not just before it.
 
     mqtt_telemetry.py now also refuses to call jtop() at all until
     wait_for_mqtt_connection() sees is_connected() return True. Since
@@ -408,18 +473,26 @@ def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fa
     shutdown_event in load_mqtt_llm()). This has no effect on what
     is_connected() itself reports.
 
-    If jtop_enter_error is given, jtop().__enter__() raises it instead;
-    the module's own `except Exception: raise` then lets it propagate
-    out of this function for real (this function re-raises it), so
-    callers can assert on the "let systemd restart" path with
-    pytest.raises(...).
+    If jtop_enter_error is given, jtop().__enter__() raises it instead
+    (see _install_fake_jtop for enter_error_times). If jtop_ok_error is
+    given, ok() raises it instead once called more than
+    jtop_ok_error_after times on a given jtop instance, simulating a
+    mid-run failure after a successful open (see _install_fake_jtop).
+    mqtt_telemetry.py's main loop now retries a jtop() failure - whether
+    at open or mid-run - rather than propagating it, so either of these
+    by itself no longer crashes the module; it just makes the module log
+    and retry, same as any other jtop outage.
     """
     mocks = dict(client_method_mocks or {})
     mocks.setdefault("connect", MagicMock(return_value=None))
     mocks.setdefault("loop_start", MagicMock(return_value=None))
     mocks.setdefault("is_connected", MagicMock(return_value=True))
 
-    enter_count = _install_fake_jtop(stats=jtop_stats, fan=jtop_fan, enter_error=jtop_enter_error)
+    enter_count = _install_fake_jtop(
+        stats=jtop_stats, fan=jtop_fan,
+        enter_error=jtop_enter_error, enter_error_times=jtop_enter_error_times,
+        ok_error=jtop_ok_error, ok_error_after=jtop_ok_error_after,
+    )
 
     mod_name = f"mqtt_telemetry_under_test_{next(_telemetry_module_counter)}"
     spec = importlib.util.spec_from_file_location(mod_name, TELEMETRY_MODULE_PATH)
@@ -427,8 +500,12 @@ def load_mqtt_telemetry(argv, client_method_mocks=None, jtop_stats=None, jtop_fa
 
     exec_errors = []
 
+    sleep_calls = {"n": 0}
+
     def fake_sleep(seconds):
-        raise SystemExit
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= sleep_calls_before_exit:
+            raise SystemExit
 
     def run():
         with patch.object(sys, "argv", ["mqtt_telemetry.py", *argv]), \
