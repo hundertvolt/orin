@@ -16,7 +16,6 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-
 from conftest import BASELINE_JTOP_FAN, BASELINE_JTOP_STATS, load_mqtt_telemetry
 
 

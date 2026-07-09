@@ -50,7 +50,7 @@ def test_shutdown_publishes_offline_status_when_connected(caplog):
     loop_stop = MagicMock()
     disconnect = MagicMock()
 
-    m = load_mqtt_llm(
+    load_mqtt_llm(
         ["--broker", "127.0.0.1", "--topic", "orin/ollama", "--loglevel", "DEBUG"],
         client_method_mocks={
             "publish": publish,

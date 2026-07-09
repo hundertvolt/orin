@@ -1,0 +1,78 @@
+[project]
+name = "orin"
+version = "0.1.0"
+description = "MQTT bridge and telemetry services for the Orin Nano"
+requires-python = ">=3.10"
+dependencies = [
+    "paho-mqtt",
+    "pydantic",
+]
+
+# jtop (jetson-stats) is intentionally not a dependency: it only installs on
+# real Jetson hardware with the jetson_stats service running, so mqtt_telemetry.py
+# can only run natively on the target device. The test suite fakes it (see
+# tests/conftest.py and tests/fixtures/), so `uv sync` works on any Linux
+# machine for running checks/tests, per that split.
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "pytest-timeout",
+    "ruff",
+]
+
+# This repo is two standalone scripts, not an installable package - `uv sync`
+# should only set up a venv with the dependencies above, not try to build/
+# install the repo itself.
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py310"
+# `ruff format` is deliberately not part of the toolchain (see CI) - line
+# breaks throughout this codebase are chosen by hand. 320 (ruff's own hard
+# ceiling for this setting) keeps length-based wrapping a non-issue on the
+# off chance format is ever run locally, on top of the E501 opt-out below.
+line-length = 320
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",  # line length - not enforced, see [tool.ruff] above
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["mqtt_llm.py", "mqtt_telemetry.py"]
+
+# Stricter than mypy's defaults, but short of --strict: catches missing/
+# incomplete annotations and unsound Optional/Any handling without the
+# noisier strict-mode checks (disallow_any_generics, disallow_untyped_calls,
+# disallow_subclassing_any) that add little value for two standalone scripts.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_return_any = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# jtop only installs on real Jetson hardware, so it isn't available - or
+# stubbed - here (see the [dependency-groups] comment above).
+module = "jtop.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+timeout_method = "thread"
