@@ -25,10 +25,7 @@ def _port_type(value: str) -> int:
 def _positive_int(value: str) -> int:
     ivalue = int(value)
     if ivalue <= 0:
-        # time.sleep() raises ValueError for a negative interval, which
-        # would otherwise surface as a crash loop instead of a clear,
-        # immediate startup rejection.
-        raise argparse.ArgumentTypeError(f"must be positive, got {ivalue}")
+        raise argparse.ArgumentTypeError(f"must be positive, got {ivalue}")  # else time.sleep() fails later, not now
     return ivalue
 
 logChoices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -103,25 +100,9 @@ def on_disconnect(
     except Exception as e:
         log.error(f"Unhandled error in on_disconnect: {e}")
 
+# Block until genuinely connected, not just connect() called, before jtop() ever starts.
+# See README.md#telemetry-connect-race for the race this closes.
 def wait_for_mqtt_connection() -> None:
-    """Block until the MQTT client is genuinely connected.
-
-    jtop() must never be started while disconnected: client.connect()
-    only sends the CONNECT packet, and the CONNACK that actually flips
-    is_connected() to True is processed asynchronously by the loop
-    thread. Proceeding to jtop() without waiting for that risks a race
-    where a fast jtop() failure checks is_connected() before the CONNACK
-    lands, skipping the shutdown path's offline publish - and by the
-    time the connection does settle moments later, the resulting
-    disconnect() looks clean, which cancels LWT delivery too. Net
-    effect: no offline announcement at all.
-
-    paho's own reconnect_delay_set backoff is already retrying in the
-    background regardless; this just waits for it to succeed (or for a
-    shutdown signal to interrupt the wait), logging periodically so a
-    persistent outage stays visible instead of being silently retried
-    forever.
-    """
     while not client.is_connected():
         connected_event.clear()
         if client.is_connected():
@@ -168,9 +149,7 @@ def handle_exit(signum: int, frame: Any | None) -> None:
     log.info(f"Received signal {signum}, shutting down...")
     raise SystemExit
 
-# Registered here, before wait_for_mqtt_connection() is ever called, so a
-# signal arriving while still waiting for the initial connection can
-# interrupt that wait too, not just the publish loop below.
+# Registered before wait_for_mqtt_connection() so a signal can interrupt that wait too.
 signal.signal(signal.SIGTERM, handle_exit)
 signal.signal(signal.SIGINT, handle_exit)
 
@@ -202,28 +181,10 @@ def _publish_payload(payload: dict[str, Any]) -> None:
         log.error(f"Telemetry publish error: {e}")
 
 
+# Build a telemetry payload from jtop and publish it over MQTT.
+# ok(spin=True)/.stats/.fan are left unguarded on purpose - exceptions here
+# propagate to the main loop's jtop retry wrapper. See README.md#jtop-lifecycle.
 def publish_telemetry(jetson: jtop) -> None:
-    """Build a telemetry payload from jtop and publish it over MQTT.
-
-    jetson.ok(spin=True) and the jetson.stats/.fan access below are
-    deliberately left unguarded: any exception either raises is meant to
-    propagate out to the main loop's jtop retry wrapper, which discards
-    this jtop instance and opens a fresh one - the same handling whether
-    jtop failed to open in the first place or broke mid-run.
-
-    ok(spin=True) matters specifically because jtop's background reader
-    thread swallows a lost connection internally (stores it, doesn't
-    raise) - jetson.stats/.fan themselves are just in-memory reads of
-    whatever was last synced and would otherwise keep returning stale
-    data forever with no error. ok() is jtop's own documented way to
-    surface that stored error; spin=True skips its normal blocking wait
-    for a fresh sample, since we already pace ourselves via
-    PUBLISH_INTERVAL and don't need jtop's own (much shorter) interval.
-
-    The MQTT publish itself is an unrelated failure mode (a jtop hiccup
-    shouldn't tear down a perfectly good MQTT connection, and vice
-    versa), so it's caught locally via _publish_payload() instead.
-    """
     jetson.ok(spin=True)
 
     stats = jetson.stats
@@ -257,14 +218,9 @@ def publish_telemetry(jetson: jtop) -> None:
     _publish_payload(payload)
 
 
+# Reports a jtop outage on the telemetry topic (real heartbeat, null sensors) -
+# distinct from the heartbeat:0 LWT/shutdown message. See README.md#jtop-lifecycle.
 def publish_offline_telemetry() -> None:
-    """Report a jtop outage on the telemetry topic itself: real
-    heartbeat, all sensor fields null, status "offline". This is
-    distinct from the LWT/shutdown offline message (which uses
-    heartbeat: 0) - the process and MQTT connection are still fine here,
-    only jtop's data is unavailable, so subscribers can tell "sensors
-    degraded" apart from "service gone" and see it flip back to "online"
-    once a retry succeeds."""
     _publish_payload({"heartbeat": int(time.time()), "status": "offline", **_OFFLINE_FIELDS})
 
 
@@ -276,21 +232,9 @@ JTOP_RETRY_DELAY_MIN = 5.0   # initial delay before retrying after a jtop failur
 JTOP_RETRY_DELAY_MAX = 60.0  # cap for the backoff below, reached after repeated failures
 
 
+# Runs jetson.close() in a daemon thread, since it can block on a locked dpkg.
+# See README.md#jtop-lifecycle. Don't call jetson.close() synchronously here.
 def _close_jtop_in_background(jetson: jtop) -> None:
-    """Close a discarded jtop instance without blocking the retry loop on it.
-
-    jtop's own __exit__ doesn't stop its background reader thread or
-    close its connection to the service - close() does, but it joins an
-    internal thread that shells out to `dpkg -l`/nvcc/opencv_version with
-    no timeout of its own (see jtop.core.command.Command.__call__,
-    jtop.core.jetson_libraries.get_all_modules). dpkg can be locked for
-    the duration of a system update - precisely the kind of outage this
-    retry loop exists to survive - so calling close() synchronously here
-    could turn "jtop is being updated" into "the service is stuck
-    forever," the opposite of what the retry loop is for. Running it in
-    its own daemon thread instead means a slow/stuck close() only delays
-    that one instance's cleanup, never recovery or shutdown.
-    """
     def run() -> None:
         try:
             jetson.close()
@@ -306,15 +250,8 @@ try:
 
     retry_delay = JTOP_RETRY_DELAY_MIN
     while True:
-        # jtop() failing to open and jtop failing mid-run (an exception
-        # raised out of publish_telemetry's ok()/stats/.fan access) are
-        # handled identically here: discard whatever jtop state exists and
-        # retry with a fresh jtop() instance after a short delay, rather
-        # than distinguishing "never connected" from "connection broke" -
-        # both mean the same thing to us, jtop is unavailable right now.
-        # SystemExit (raised by handle_exit() on SIGTERM/SIGINT, including
-        # while blocked in the time.sleep() below) is not an Exception
-        # subclass, so it always passes through this untouched.
+        # jtop() failing to open or breaking mid-run are handled identically: discard and retry.
+        # SystemExit isn't an Exception subclass, so it passes through untouched. See README.md#jtop-lifecycle.
         try:
             with jtop() as jetsonTop:
                 log.info("Connected to jtop.")
@@ -329,12 +266,7 @@ try:
             log.error(f"jtop error, retrying in {retry_delay:.0f}s: {e}")
             publish_offline_telemetry()
             time.sleep(retry_delay)
-            # Back off on repeated failures: a fresh jtop() instance isn't
-            # free (see _close_jtop_in_background) and retrying it every
-            # JTOP_RETRY_DELAY_MIN for the length of a whole system update
-            # would pile up far more of that work than a longer outage
-            # warrants.
-            retry_delay = min(retry_delay * 2, JTOP_RETRY_DELAY_MAX)
+            retry_delay = min(retry_delay * 2, JTOP_RETRY_DELAY_MAX)  # back off - a fresh jtop() isn't free
 
 except SystemExit:
     log.debug("SystemExit received, stopping main loop.")
