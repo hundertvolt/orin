@@ -12,6 +12,10 @@ directly with `python3 <script>.py`, deployed as its own systemd unit. Keep
 them that way — do not merge them, split them into modules, or turn this into
 an installable package unless explicitly asked.
 
+`systemd/` has the unit files and install script for deploying both as
+systemd services on the device (see README.md's Deploying as systemd services
+section) - keep it in sync if either script's CLI flags change.
+
 Target runtime is JetPack 6.x / Python 3.10 on real Jetson hardware. `jtop`
 (jetson-stats) only installs there, so `mqtt_telemetry.py` cannot actually run
 off-device — but the whole toolchain (lint, type check, tests) works on any
