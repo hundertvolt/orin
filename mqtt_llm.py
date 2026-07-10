@@ -147,10 +147,9 @@ connected_event = threading.Event()
 CONNECT_RETRY_LOG_INTERVAL = 5.0  # how often to log while waiting for the initial connection
 active_responses_lock = threading.Lock()
 
+# Captures the raw socket so shutdown can interrupt an in-flight Ollama call.
+# See README.md#activegeneration-socket-capture for why conn.sock alone isn't enough.
 class ActiveGeneration:
-    """Captures the raw socket so shutdown can interrupt an in-flight Ollama call.
-    See README.md#activegeneration-socket-capture for why conn.sock alone isn't enough."""
-
     def __init__(self, conn: http.client.HTTPConnection) -> None:
         self._conn = conn
         self._sock: socket.socket | None = None
@@ -164,12 +163,10 @@ class ActiveGeneration:
         return self._sock
 
     def connect(self) -> None:
-        """Open the connection and capture its socket, before getresponse() can null it."""
-        self._conn.connect()
+        self._conn.connect()  # capture the socket now, before getresponse() can null it
         self._sock = self._conn.sock
 
-    def shutdown(self) -> None:
-        """Interrupt a thread blocked reading the captured socket, if any."""
+    def shutdown(self) -> None:  # interrupt a thread blocked reading the captured socket, if any
         if self._sock is not None:
             try:
                 self._sock.shutdown(socket.SHUT_RDWR)
@@ -184,8 +181,9 @@ class ActiveGeneration:
 
 active_responses: dict[str, ActiveGeneration] = {}
 
+# Raised when an in-flight Ollama generation is aborted due to shutdown.
 class GenerationCancelled(Exception):
-    """Raised when an in-flight Ollama generation is aborted due to shutdown."""
+    pass
 
 # ------------------------------
 # Queue status tracking
@@ -203,9 +201,9 @@ def update_queue_progress(seq: int, response_chars: int, thinking_chars: int) ->
             entry["response_chars"] = response_chars
             entry["thinking_chars"] = thinking_chars
 
+# Queue entries in processing order, with progress counters.
+# See README.md#response-thinking-chars-semantics for field meanings.
 def build_queue_snapshot() -> list[dict[str, Any]]:
-    """Queue entries in processing order, with progress counters.
-    See README.md#response-thinking-chars-semantics for field meanings."""
     with queue_status_lock:
         return [
             {
@@ -282,9 +280,9 @@ def on_disconnect(
     except Exception as e:
         log.error(f"Unhandled error in on_disconnect: {e}")
 
+# Block until genuinely connected (not just connect() called) or shutdown requested.
+# See README.md#connect-shutdown-races for the race this closes.
 def wait_for_mqtt_connection() -> None:
-    """Block until genuinely connected (not just connect() called) or shutdown requested.
-    See README.md#connect-shutdown-races for the race this closes."""
     while not client.is_connected() and not shutdown_event.is_set():
         connected_event.clear()
         if client.is_connected() or shutdown_event.is_set():
@@ -360,8 +358,8 @@ def build_ollama_payload(request: OllamaRequest) -> dict[str, Any]:
 
     return payload
 
+# seq is the queue_status tracking key, not request.request_id. See README.md#request-id-is-not-a-key.
 def stream_ollama_generate(request: OllamaRequest, seq: int | None = None) -> dict[str, Any]:
-    """seq is the queue_status tracking key, not request.request_id. See README.md#request-id-is-not-a-key."""
     payload = build_ollama_payload(request)
     body = json.dumps(payload).encode("utf-8")
 

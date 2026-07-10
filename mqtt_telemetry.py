@@ -100,9 +100,9 @@ def on_disconnect(
     except Exception as e:
         log.error(f"Unhandled error in on_disconnect: {e}")
 
+# Block until genuinely connected, not just connect() called, before jtop() ever starts.
+# See README.md#telemetry-connect-race for the race this closes.
 def wait_for_mqtt_connection() -> None:
-    """Block until genuinely connected, not just connect() called, before jtop() ever starts.
-    See README.md#telemetry-connect-race for the race this closes."""
     while not client.is_connected():
         connected_event.clear()
         if client.is_connected():
@@ -181,10 +181,10 @@ def _publish_payload(payload: dict[str, Any]) -> None:
         log.error(f"Telemetry publish error: {e}")
 
 
+# Build a telemetry payload from jtop and publish it over MQTT.
+# ok(spin=True)/.stats/.fan are left unguarded on purpose - exceptions here
+# propagate to the main loop's jtop retry wrapper. See README.md#jtop-lifecycle.
 def publish_telemetry(jetson: jtop) -> None:
-    """Build a telemetry payload from jtop and publish it over MQTT.
-    ok(spin=True)/.stats/.fan are left unguarded on purpose - exceptions here
-    propagate to the main loop's jtop retry wrapper. See README.md#jtop-lifecycle."""
     jetson.ok(spin=True)
 
     stats = jetson.stats
@@ -218,9 +218,9 @@ def publish_telemetry(jetson: jtop) -> None:
     _publish_payload(payload)
 
 
+# Reports a jtop outage on the telemetry topic (real heartbeat, null sensors) -
+# distinct from the heartbeat:0 LWT/shutdown message. See README.md#jtop-lifecycle.
 def publish_offline_telemetry() -> None:
-    """Reports a jtop outage on the telemetry topic (real heartbeat, null sensors) -
-    distinct from the heartbeat:0 LWT/shutdown message. See README.md#jtop-lifecycle."""
     _publish_payload({"heartbeat": int(time.time()), "status": "offline", **_OFFLINE_FIELDS})
 
 
@@ -232,9 +232,9 @@ JTOP_RETRY_DELAY_MIN = 5.0   # initial delay before retrying after a jtop failur
 JTOP_RETRY_DELAY_MAX = 60.0  # cap for the backoff below, reached after repeated failures
 
 
+# Runs jetson.close() in a daemon thread, since it can block on a locked dpkg.
+# See README.md#jtop-lifecycle. Don't call jetson.close() synchronously here.
 def _close_jtop_in_background(jetson: jtop) -> None:
-    """Runs jetson.close() in a daemon thread, since it can block on a locked dpkg.
-    See README.md#jtop-lifecycle. Don't call jetson.close() synchronously here."""
     def run() -> None:
         try:
             jetson.close()

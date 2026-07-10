@@ -150,11 +150,13 @@ an internal id rather than by the caller-supplied `request_id`).
   decision (see the comment above `[tool.ruff]` in `pyproject.toml`). If a
   tool or auto-fix wants to reflow lines, drop it or scope it down rather
   than accepting the reflow.
-- Comments and docstrings are deliberately terse — a line or two at most,
-  pointing at README.md's Design rationale section (`# see README.md#...`)
-  for anything that needs more than that. Don't restate the code, and
-  don't reintroduce long inline explanations; extend the README section
-  instead, and keep CLAUDE.md's own invariants above in sync with it.
+- No docstrings — `#` comments only, everywhere, including on functions and
+  classes. Comments are deliberately terse — a line or two at most, pointing
+  at README.md's Design rationale section (`# see README.md#...`) for
+  anything that needs more than that. Don't restate the code, and don't
+  reintroduce long inline explanations or reach for a docstring to hold one;
+  extend the README section instead, and keep CLAUDE.md's own invariants
+  above in sync with it.
 - Modern typing: `X | None` not `Optional[X]`, `dict[...]`/`list[...]` not
   `Dict[...]`/`List[...]` (enforced by Ruff's `UP` rules).
 - paho-mqtt callbacks must use paho's real typed signatures
