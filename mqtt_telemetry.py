@@ -113,7 +113,7 @@ def wait_for_mqtt_connection() -> None:
                 "retrying in the background..."
             )
 
-client = mqtt.Client(client_id="orin_nano", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+client = mqtt.Client(client_id="orin_telemetry", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 client.max_queued_messages_set(5)
 client.will_set(MQTT_TOPIC, json.dumps({"heartbeat": 0, "status": "offline"}), qos=1, retain=True)
 client.reconnect_delay_set(min_delay=1, max_delay=30)
