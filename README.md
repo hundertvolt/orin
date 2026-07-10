@@ -40,12 +40,24 @@ The integration tests spin up a real local Mosquitto broker as a subprocess, so 
 `systemd/` has unit files and an install script for running both scripts as systemd services on the Orin Nano itself:
 
 ```bash
-sudo systemd/install.sh --broker 192.168.1.10 --username orin-mqtt
+sudo systemd/install.sh --broker 192.168.1.10 --username orin-mqtt --password 'the-mqtt-password'
 ```
 
-This creates a dedicated `orin-mqtt` system user (no login, no home directory), adds it to the `jtop` group (required for `mqtt_telemetry.py` to reach `jtop.sock` — see [jtop lifecycle](#jtop-lifecycle)), copies both scripts to `/opt/orin-mqtt`, creates an empty `/etc/orin-mqtt/mqtt_password` for you to fill in (never overwritten on re-run), and installs `orin-mqtt-telemetry.service` / `orin-mqtt-llm.service` into `/etc/systemd/system` with the broker host and username substituted in. It's safe to re-run - it skips anything already in place. Nothing is enabled or started automatically; the script prints the exact `systemctl enable --now ...` command to run once the password is in place.
+Run from a clone of this repo on the device itself (it installs from its own working copy, not from the network). This creates a dedicated `orin-mqtt` system user (no login, no home directory), adds it to the `jtop` group (required for `mqtt_telemetry.py` to reach `jtop.sock` — see [jtop lifecycle](#jtop-lifecycle)), copies both scripts to `/opt/orin-mqtt`, writes `--password` into `/etc/orin-mqtt/mqtt_password` (root-only, mode `600`), installs `orin-mqtt-telemetry.service` / `orin-mqtt-llm.service` into `/etc/systemd/system` with `--broker`/`--username` substituted in, then runs `systemctl daemon-reload`, `enable`, and `start` for both units. It's safe to re-run — re-running with new values doubles as how you rotate the broker host/username/password later. `--password` on the command line ends up in your shell history and briefly in `ps` output for other local users; fine for a single-user device behind a router, but clear your shell history afterwards if that matters to you.
 
-Both units run as the unprivileged `orin-mqtt` user with a baseline of systemd sandboxing (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, etc.) and `Restart=always`, so a genuinely unexpected crash still gets a systemd restart as the last-resort fallback - the normal case of a dependency outage (Ollama or jtop bouncing) is handled in-process by each script instead, without needing a restart. The telemetry unit orders itself after `jtop.service` (jetson-stats' own background daemon) and the LLM unit after `ollama.service` (Ollama's default systemd unit, if installed that way) - both are just ordering hints, not hard requirements, since each script already retries a dependency outage on its own.
+Both units run as the unprivileged `orin-mqtt` user with a baseline of systemd sandboxing (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, etc.) and `Restart=always`, so a genuinely unexpected crash still gets a systemd restart as the last-resort fallback - the normal case of a dependency outage (Ollama or jtop bouncing) is handled in-process by each script instead, without needing a restart. The telemetry unit orders itself after `jtop.service` (jetson-stats' own background daemon) and the LLM unit after `ollama.service` (Ollama's default systemd unit) - both are just ordering hints, not hard requirements, since each script already retries a dependency outage on its own.
+
+Useful commands once installed (easy to forget, worth having on hand):
+
+```bash
+# check status
+sudo systemctl status orin-mqtt-telemetry.service
+sudo systemctl status orin-mqtt-llm.service
+
+# follow logs
+sudo journalctl -u orin-mqtt-telemetry.service -f
+sudo journalctl -u orin-mqtt-llm.service -f
+```
 
 ## Reference
 

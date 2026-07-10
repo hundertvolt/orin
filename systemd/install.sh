@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
-# Installs mqtt_telemetry.py and mqtt_llm.py as systemd services on a Jetson Orin Nano.
-# Run as root. Safe to re-run: skips anything already in place, never overwrites
-# an existing MQTT credential file.
+# Installs and starts mqtt_telemetry.py and mqtt_llm.py as systemd services on a
+# Jetson Orin Nano. Run as root. Safe to re-run: skips anything already in place,
+# and re-applies the given password/broker/username each time so re-running with
+# updated values doubles as a way to rotate them.
+#
+# Note: --password on the command line ends up in shell history and briefly in
+# `ps` output for other users on the box. Fine for a single-user device behind a
+# router; clear your shell history afterwards if that matters to you.
 set -euo pipefail
 
 usage() {
-    echo "Usage: sudo $0 --broker <host> --username <mqtt-user>" >&2
+    echo "Usage: sudo $0 --broker <host> --username <mqtt-user> --password <mqtt-password>" >&2
     exit 1
 }
 
 BROKER=""
 MQTT_USER=""
+MQTT_PASSWORD=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --broker) BROKER="$2"; shift 2 ;;
         --username) MQTT_USER="$2"; shift 2 ;;
+        --password) MQTT_PASSWORD="$2"; shift 2 ;;
         *) usage ;;
     esac
 done
 
-[[ -n "$BROKER" && -n "$MQTT_USER" ]] || usage
+[[ -n "$BROKER" && -n "$MQTT_USER" && -n "$MQTT_PASSWORD" ]] || usage
 [[ "$(id -u)" -eq 0 ]] || { echo "Run as root (sudo)." >&2; exit 1; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,6 +35,7 @@ INSTALL_DIR=/opt/orin-mqtt
 CONF_DIR=/etc/orin-mqtt
 CRED_FILE="$CONF_DIR/mqtt_password"
 UNIT_DIR=/etc/systemd/system
+SERVICES=(orin-mqtt-telemetry orin-mqtt-llm)
 
 if ! getent passwd orin-mqtt >/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin --comment "Orin MQTT services" orin-mqtt
@@ -44,25 +52,29 @@ install -m 755 -o orin-mqtt -g orin-mqtt "$REPO_DIR/mqtt_telemetry.py" "$INSTALL
 install -m 755 -o orin-mqtt -g orin-mqtt "$REPO_DIR/mqtt_llm.py" "$INSTALL_DIR/mqtt_llm.py"
 
 mkdir -p "$CONF_DIR"
-if [[ ! -f "$CRED_FILE" ]]; then
-    install -m 600 -o root -g root /dev/null "$CRED_FILE"
-    echo "Created $CRED_FILE - edit it now and put the MQTT password inside before starting the services."
-else
-    echo "$CRED_FILE already exists, leaving it untouched."
-fi
+install -m 600 -o root -g root /dev/null "$CRED_FILE"
+printf '%s' "$MQTT_PASSWORD" > "$CRED_FILE"
 
-for svc in orin-mqtt-telemetry orin-mqtt-llm; do
+for svc in "${SERVICES[@]}"; do
     sed -e "s/<HOST_IP>/$BROKER/g" -e "s/<USERNAME>/$MQTT_USER/g" \
         "$REPO_DIR/systemd/$svc.service" > "$UNIT_DIR/$svc.service"
     chmod 644 "$UNIT_DIR/$svc.service"
 done
 
+SERVICE_UNITS=("${SERVICES[@]/%/.service}")
 systemctl daemon-reload
+systemctl enable "${SERVICE_UNITS[@]}"
+systemctl start "${SERVICE_UNITS[@]}"
 
 cat <<EOF
 
-Installed. Next steps:
-  1. Confirm the MQTT password in $CRED_FILE.
-  2. sudo systemctl enable --now orin-mqtt-telemetry.service orin-mqtt-llm.service
-  3. sudo systemctl status orin-mqtt-telemetry.service orin-mqtt-llm.service
+Installed, enabled, and started: ${SERVICE_UNITS[*]}
+
+Check status:
+  sudo systemctl status orin-mqtt-telemetry.service
+  sudo systemctl status orin-mqtt-llm.service
+
+Follow logs:
+  sudo journalctl -u orin-mqtt-telemetry.service -f
+  sudo journalctl -u orin-mqtt-llm.service -f
 EOF
