@@ -2,7 +2,7 @@
 
 MQTT-based services for an NVIDIA Jetson Orin Nano: a bridge to a local Ollama LLM server, and a system telemetry publisher.
 
-**Contents:** [mqtt_llm.py](#mqtt_llmpy) · [mqtt_telemetry.py](#mqtt_telemetrypy) · [Running checks locally](#running-checks-locally) · [Reference](#reference) · [Design rationale](#design-rationale)
+**Contents:** [mqtt_llm.py](#mqtt_llmpy) · [mqtt_telemetry.py](#mqtt_telemetrypy) · [Running checks locally](#running-checks-locally) · [Deploying as systemd services](#deploying-as-systemd-services) · [Reference](#reference) · [Design rationale](#design-rationale)
 
 ## mqtt_llm.py
 
@@ -34,6 +34,30 @@ Requires [uv](https://docs.astral.sh/uv/). `uv sync` sets up everything else, in
 ```
 
 The integration tests spin up a real local Mosquitto broker as a subprocess, so the `mosquitto` binary needs to be on `PATH` (e.g. `apt install mosquitto`); `scripts/test.sh` warns if it's missing.
+
+## Deploying as systemd services
+
+`systemd/` has unit files and an install script for running both scripts as systemd services on the Orin Nano itself:
+
+```bash
+sudo systemd/install.sh --broker 192.168.1.10 --username orin-mqtt --password 'the-mqtt-password'
+```
+
+Run from a clone of this repo on the device itself (it installs from its own working copy, not from the network). This creates a dedicated `orin-mqtt` system user (no login, no home directory), adds it to the `jtop` group (required for `mqtt_telemetry.py` to reach `jtop.sock` — see [jtop lifecycle](#jtop-lifecycle)), copies both scripts to `/opt/orin-mqtt`, writes `--password` into `/etc/orin-mqtt/mqtt_password` (root-only, mode `600`), installs `orin-mqtt-telemetry.service` / `orin-mqtt-llm.service` into `/etc/systemd/system` with `--broker`/`--username` substituted in, then runs `systemctl daemon-reload`, `enable`, and `start` for both units. It's safe to re-run — re-running with new values doubles as how you rotate the broker host/username/password later. `--password` on the command line ends up in your shell history and briefly in `ps` output for other local users; fine for a single-user device behind a router, but clear your shell history afterwards if that matters to you.
+
+Both units run as the unprivileged `orin-mqtt` user with a baseline of systemd sandboxing (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, etc.) and `Restart=always`, so a genuinely unexpected crash still gets a systemd restart as the last-resort fallback - the normal case of a dependency outage (Ollama or jtop bouncing) is handled in-process by each script instead, without needing a restart. The telemetry unit orders itself after `jtop.service` (jetson-stats' own background daemon) and the LLM unit after `ollama.service` (Ollama's default systemd unit) - both are just ordering hints, not hard requirements, since each script already retries a dependency outage on its own.
+
+Useful commands once installed (easy to forget, worth having on hand):
+
+```bash
+# check status
+sudo systemctl status orin-mqtt-telemetry.service
+sudo systemctl status orin-mqtt-llm.service
+
+# follow logs
+sudo journalctl -u orin-mqtt-telemetry.service -f
+sudo journalctl -u orin-mqtt-llm.service -f
+```
 
 ## Reference
 
@@ -133,6 +157,7 @@ Any field is `null` if the corresponding sensor/stat isn't available. If jtop it
 - `mqtt_llm.py`, `mqtt_telemetry.py` - the two services, each a single standalone script
 - `tests/` - pytest suite: a real local Mosquitto broker, a fake Ollama HTTP server, and a faked `jtop` module (see `tests/conftest.py`)
 - `scripts/` - local entry points for the same checks CI runs
+- `systemd/` - unit files and an install script for running both services on the Orin Nano itself (see [Deploying as systemd services](#deploying-as-systemd-services))
 - `.github/workflows/ci.yml` - CI: `mypy`, `ruff check`, `pytest`, each also runnable via `scripts/`
 - `pyproject.toml` - single source of truth for dependencies (`uv`) and tool config (`ruff`, `mypy`, `pytest`)
 

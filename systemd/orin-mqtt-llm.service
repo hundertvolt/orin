@@ -1,0 +1,34 @@
+[Unit]
+Description=Orin Nano MQTT LLM Bridge Service
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=orin-mqtt
+Group=orin-mqtt
+
+WorkingDirectory=/opt/orin-mqtt
+
+LoadCredential=mqtt_password:/etc/orin-mqtt/mqtt_password
+
+ExecStart=/usr/bin/python3 /opt/orin-mqtt/mqtt_llm.py \
+    --broker <HOST_IP> \
+    --username <USERNAME> \
+    --credpath /run/credentials/orin-mqtt-llm.service/mqtt_password
+
+Restart=always
+RestartSec=5
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target
