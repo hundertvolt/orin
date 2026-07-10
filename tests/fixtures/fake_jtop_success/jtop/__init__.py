@@ -14,6 +14,12 @@ class jtop:
     def __exit__(self, exc_type, exc, tb):
         return False
 
+    def ok(self, spin=False):
+        return True
+
+    def close(self):
+        pass
+
     @property
     def stats(self):
         return {

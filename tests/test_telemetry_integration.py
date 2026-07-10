@@ -199,26 +199,41 @@ def test_offline_status_on_clean_shutdown(telemetry_service_factory, probe_clien
     _assert_retained(mosquitto_broker, "orin/status", {"heartbeat": 0, "status": "offline"})
 
 
-def test_jtop_failure_exits_nonzero_and_still_publishes_offline(telemetry_service_factory, probe_client, mosquitto_broker):
-    """Regression test for the systemd-restart fix, end to end: a jtop
-    that fails to open must make the process exit non-zero (so
-    Restart=on-failure fires) while still publishing the offline status
-    for the MQTT connection it did manage to establish."""
+def test_jtop_failure_retries_instead_of_exiting(telemetry_service_factory, probe_client):
+    """End-to-end regression test for the jtop retry-not-crash behavior:
+    a jtop that fails to open must not make the process exit on its own
+    - it should keep logging retries and stay alive, relying on jtop's
+    own recovery rather than a systemd restart. The MQTT connection this
+    process did establish must also stay up and untouched throughout,
+    since a jtop outage is unrelated to it. It must also report the
+    outage live on the telemetry topic itself (status "offline", real
+    heartbeat), not just go quiet."""
     client, received = probe_client
     client.subscribe("orin/status", qos=1)
     time.sleep(0.3)
 
     svc = telemetry_service_factory(topic="orin/status", jtop_scenario="fail")
-    rc = svc.proc.wait(timeout=10)
+    assert svc.wait_for_log("jtop error, retrying"), svc.text()
 
-    assert rc != 0, "jtop failure should exit non-zero so systemd restarts the service: " + svc.text()
-    assert "Error in main loop" in svc.text()
-    assert "Shutdown complete." in svc.text()
+    assert svc.proc.poll() is None, "a jtop outage must not exit the process: " + svc.text()
+    assert "Telemetry service started" in svc.text()
+    assert "Error in main loop" not in svc.text()
 
     assert _wait_until(lambda: len(received) >= 1), "no offline status observed after jtop failure: " + svc.text()
     topic, payload, retain = received[-1]
+    body = json.loads(payload)
+    assert body["status"] == "offline"
+    assert body["heartbeat"] != 0  # process/MQTT are still alive - only jtop is down
+    received.clear()
+
+    svc.proc.send_signal(signal.SIGTERM)
+    rc = svc.proc.wait(timeout=10)
+    assert rc == 0, svc.text()
+    assert "Shutdown complete." in svc.text()
+
+    assert _wait_until(lambda: len(received) >= 1), "no offline status observed after shutdown: " + svc.text()
+    topic, payload, retain = received[-1]
     assert json.loads(payload) == {"heartbeat": 0, "status": "offline"}
-    _assert_retained(mosquitto_broker, "orin/status", {"heartbeat": 0, "status": "offline"})
 
 
 def test_jtop_never_started_and_signal_interrupts_indefinite_wait():

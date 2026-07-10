@@ -178,38 +178,19 @@ signal.signal(signal.SIGINT, handle_exit)
 # Telemetry publishing
 # ------------------------------
 
-def publish_telemetry(jetson: jtop) -> None:
+_OFFLINE_FIELDS = {
+    "uptime_s": None, "cpu_avg": None, "cpu_max": None,
+    "ram_used_ratio": None, "swap_used_ratio": None, "gpu_load": None,
+    "fan_pwm": None, "fan_rpm": None,
+    "temp_max": None, "temp_cpu": None, "temp_gpu": None,
+    "power_total": None,
+}
+
+
+def _publish_payload(payload: dict[str, Any]) -> None:
+    payload_str = json.dumps(payload)
+    log.debug(f"Generated payload: {payload_str}")
     try:
-        stats = jetson.stats
-
-        # --- CPU handling ---
-        cpu_cores = {k: v for k, v in stats.items() if k.startswith("CPU")}
-
-        # --- Temperature handling (filter invalid -256) ---
-        temps = {k: v for k, v in stats.items() if k.startswith("Temp ") and v != -256}
-
-        # Fan handling
-        fan = jetson.fan.get("pwmfan", {})
-
-        payload = {
-            "heartbeat": int(time.time()),
-            "uptime_s": int(uptime.total_seconds()) if (uptime := stats.get("uptime")) is not None else None,
-            "cpu_avg": sum(cpu_cores.values()) / len(cpu_cores) if cpu_cores else None,
-            "cpu_max": max(cpu_cores.values()) if cpu_cores else None,
-            "ram_used_ratio": stats.get("RAM"),
-            "swap_used_ratio": stats.get("SWAP"),
-            "gpu_load": stats.get("GPU"),
-            "fan_pwm": fan.get("speed", [None])[0],
-            "fan_rpm": fan.get("rpm", [None])[0],
-            "temp_max": max(temps.values()) if temps else None,
-            "temp_cpu": stats.get("Temp cpu"),
-            "temp_gpu": stats.get("Temp gpu"),
-            "power_total": power * 1e-3 if (power := stats.get("Power TOT")) is not None else None,
-            "status": "online",
-        }
-
-        payload_str = json.dumps(payload)
-        log.debug(f"Generated payload: {payload_str}")
         if client.is_connected():
             log.debug(f"Publishing to topic {MQTT_TOPIC}")
             info = client.publish(MQTT_TOPIC, payload_str, qos=1, retain=False)
@@ -221,17 +202,139 @@ def publish_telemetry(jetson: jtop) -> None:
         log.error(f"Telemetry publish error: {e}")
 
 
+def publish_telemetry(jetson: jtop) -> None:
+    """Build a telemetry payload from jtop and publish it over MQTT.
+
+    jetson.ok(spin=True) and the jetson.stats/.fan access below are
+    deliberately left unguarded: any exception either raises is meant to
+    propagate out to the main loop's jtop retry wrapper, which discards
+    this jtop instance and opens a fresh one - the same handling whether
+    jtop failed to open in the first place or broke mid-run.
+
+    ok(spin=True) matters specifically because jtop's background reader
+    thread swallows a lost connection internally (stores it, doesn't
+    raise) - jetson.stats/.fan themselves are just in-memory reads of
+    whatever was last synced and would otherwise keep returning stale
+    data forever with no error. ok() is jtop's own documented way to
+    surface that stored error; spin=True skips its normal blocking wait
+    for a fresh sample, since we already pace ourselves via
+    PUBLISH_INTERVAL and don't need jtop's own (much shorter) interval.
+
+    The MQTT publish itself is an unrelated failure mode (a jtop hiccup
+    shouldn't tear down a perfectly good MQTT connection, and vice
+    versa), so it's caught locally via _publish_payload() instead.
+    """
+    jetson.ok(spin=True)
+
+    stats = jetson.stats
+
+    # --- CPU handling ---
+    cpu_cores = {k: v for k, v in stats.items() if k.startswith("CPU")}
+
+    # --- Temperature handling (filter invalid -256) ---
+    temps = {k: v for k, v in stats.items() if k.startswith("Temp ") and v != -256}
+
+    # Fan handling
+    fan = jetson.fan.get("pwmfan", {})
+
+    payload = {
+        "heartbeat": int(time.time()),
+        "uptime_s": int(uptime.total_seconds()) if (uptime := stats.get("uptime")) is not None else None,
+        "cpu_avg": sum(cpu_cores.values()) / len(cpu_cores) if cpu_cores else None,
+        "cpu_max": max(cpu_cores.values()) if cpu_cores else None,
+        "ram_used_ratio": stats.get("RAM"),
+        "swap_used_ratio": stats.get("SWAP"),
+        "gpu_load": stats.get("GPU"),
+        "fan_pwm": fan.get("speed", [None])[0],
+        "fan_rpm": fan.get("rpm", [None])[0],
+        "temp_max": max(temps.values()) if temps else None,
+        "temp_cpu": stats.get("Temp cpu"),
+        "temp_gpu": stats.get("Temp gpu"),
+        "power_total": power * 1e-3 if (power := stats.get("Power TOT")) is not None else None,
+        "status": "online",
+    }
+
+    _publish_payload(payload)
+
+
+def publish_offline_telemetry() -> None:
+    """Report a jtop outage on the telemetry topic itself: real
+    heartbeat, all sensor fields null, status "offline". This is
+    distinct from the LWT/shutdown offline message (which uses
+    heartbeat: 0) - the process and MQTT connection are still fine here,
+    only jtop's data is unavailable, so subscribers can tell "sensors
+    degraded" apart from "service gone" and see it flip back to "online"
+    once a retry succeeds."""
+    _publish_payload({"heartbeat": int(time.time()), "status": "offline", **_OFFLINE_FIELDS})
+
+
 # ------------------------------
 # Main loop using jtop
 # ------------------------------
 
+JTOP_RETRY_DELAY_MIN = 5.0   # initial delay before retrying after a jtop failure
+JTOP_RETRY_DELAY_MAX = 60.0  # cap for the backoff below, reached after repeated failures
+
+
+def _close_jtop_in_background(jetson: jtop) -> None:
+    """Close a discarded jtop instance without blocking the retry loop on it.
+
+    jtop's own __exit__ doesn't stop its background reader thread or
+    close its connection to the service - close() does, but it joins an
+    internal thread that shells out to `dpkg -l`/nvcc/opencv_version with
+    no timeout of its own (see jtop.core.command.Command.__call__,
+    jtop.core.jetson_libraries.get_all_modules). dpkg can be locked for
+    the duration of a system update - precisely the kind of outage this
+    retry loop exists to survive - so calling close() synchronously here
+    could turn "jtop is being updated" into "the service is stuck
+    forever," the opposite of what the retry loop is for. Running it in
+    its own daemon thread instead means a slow/stuck close() only delays
+    that one instance's cleanup, never recovery or shutdown.
+    """
+    def run() -> None:
+        try:
+            jetson.close()
+        except Exception as e:
+            log.warning(f"Error closing jtop: {e}")
+
+    threading.Thread(target=run, name="jtop-close", daemon=True).start()
+
+
 try:
     wait_for_mqtt_connection()
-    with jtop() as jetsonTop:
-        log.info(f"Telemetry service started using topic: {MQTT_TOPIC}.")
-        while True:
-            publish_telemetry(jetsonTop)
-            time.sleep(PUBLISH_INTERVAL)
+    log.info(f"Telemetry service started using topic: {MQTT_TOPIC}.")
+
+    retry_delay = JTOP_RETRY_DELAY_MIN
+    while True:
+        # jtop() failing to open and jtop failing mid-run (an exception
+        # raised out of publish_telemetry's ok()/stats/.fan access) are
+        # handled identically here: discard whatever jtop state exists and
+        # retry with a fresh jtop() instance after a short delay, rather
+        # than distinguishing "never connected" from "connection broke" -
+        # both mean the same thing to us, jtop is unavailable right now.
+        # SystemExit (raised by handle_exit() on SIGTERM/SIGINT, including
+        # while blocked in the time.sleep() below) is not an Exception
+        # subclass, so it always passes through this untouched.
+        try:
+            with jtop() as jetsonTop:
+                log.info("Connected to jtop.")
+                retry_delay = JTOP_RETRY_DELAY_MIN  # reachable again - reset the backoff
+                try:
+                    while True:
+                        publish_telemetry(jetsonTop)
+                        time.sleep(PUBLISH_INTERVAL)
+                finally:
+                    _close_jtop_in_background(jetsonTop)
+        except Exception as e:
+            log.error(f"jtop error, retrying in {retry_delay:.0f}s: {e}")
+            publish_offline_telemetry()
+            time.sleep(retry_delay)
+            # Back off on repeated failures: a fresh jtop() instance isn't
+            # free (see _close_jtop_in_background) and retrying it every
+            # JTOP_RETRY_DELAY_MIN for the length of a whole system update
+            # would pile up far more of that work than a longer outage
+            # warrants.
+            retry_delay = min(retry_delay * 2, JTOP_RETRY_DELAY_MAX)
 
 except SystemExit:
     log.debug("SystemExit received, stopping main loop.")
