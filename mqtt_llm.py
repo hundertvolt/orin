@@ -148,18 +148,8 @@ CONNECT_RETRY_LOG_INTERVAL = 5.0  # how often to log while waiting for the initi
 active_responses_lock = threading.Lock()
 
 class ActiveGeneration:
-    """Tracks an in-flight Ollama call so shutdown can interrupt it.
-
-    http.client's getresponse() closes and nulls HTTPConnection.sock as
-    soon as it reads a response with no Content-Length (true for our
-    streamed NDJSON responses) - "passing" the live socket to the
-    response object instead. So conn.sock can't be relied on to reach
-    the connection once streaming has started. We capture the raw
-    socket reference right after connect(), before getresponse() can
-    null it, and shut that down directly - the underlying socket object
-    stays valid (only conn's reference to it is cleared) and its
-    shutdown() call still interrupts a thread blocked reading it.
-    """
+    """Captures the raw socket so shutdown can interrupt an in-flight Ollama call.
+    See README.md#activegeneration-socket-capture for why conn.sock alone isn't enough."""
 
     def __init__(self, conn: http.client.HTTPConnection) -> None:
         self._conn = conn
@@ -200,18 +190,8 @@ class GenerationCancelled(Exception):
 # ------------------------------
 # Queue status tracking
 # ------------------------------
-# request_id is caller-supplied and must be treated as an arbitrary,
-# opaque label: it's never validated for uniqueness (or non-emptiness
-# beyond being a string), so nothing internal may use it as a lookup
-# key - two, or two hundred, queued requests can legitimately share the
-# same request_id (or all be ""). queue_status is therefore keyed by
-# _queue_seq (a private, always-unique counter assigned at enqueue
-# time), with each entry's own "request_id" field carried purely as a
-# label to report back, never as an identity. Insertion order into this
-# dict == processing order (queue_status is a plain dict, and
-# request_queue is FIFO), so this also doubles as the queue's own order
-# record - no separate structure needed to answer "what order will
-# these process in".
+# Keyed by _queue_seq, not request_id, which may repeat or be empty.
+# See README.md#request-id-is-not-a-key.
 _queue_seq_counter = itertools.count()
 queue_status_lock = threading.Lock()
 queue_status: dict[int, dict[str, Any]] = {}
@@ -224,15 +204,8 @@ def update_queue_progress(seq: int, response_chars: int, thinking_chars: int) ->
             entry["thinking_chars"] = thinking_chars
 
 def build_queue_snapshot() -> list[dict[str, Any]]:
-    """The queue's essence for a status subscriber: IDs in the order
-    they'll be processed, each with independent response/thinking
-    progress counters. response_chars follows -1 queued but not yet
-    started, 0 started with nothing generated yet, otherwise the
-    current character count. thinking_chars follows the same -1/0/N
-    shape, but -1 also covers "no thinking activity has been observed
-    for this request yet" - since not every model streams a "thinking"
-    field, it only leaves -1 once one actually appears (see the
-    thinking_started tracking in stream_ollama_generate)."""
+    """Queue entries in processing order, with progress counters.
+    See README.md#response-thinking-chars-semantics for field meanings."""
     with queue_status_lock:
         return [
             {
@@ -252,17 +225,10 @@ def build_status_payload(online: bool) -> dict[str, Any]:
         "queue": build_queue_snapshot(),
     }
 
-# The offline payload never varies, so both places that need it (the LWT
-# and the explicit clean-shutdown publish) share this one precomputed
-# encoding instead of each separately calling build_status_payload(False).
+# Shared by the LWT and the clean-shutdown publish - the offline payload never varies.
 OFFLINE_STATUS_JSON = json.dumps(build_status_payload(online=False))
 
-# Serializes build_status_payload()+cli.publish() as one unit across
-# threads (on_message, ollama_worker, status_publisher all call this).
-# Without it, two concurrent calls could interleave so the one that
-# snapshotted queue_status *first* is still the one whose publish()
-# reaches the broker *last* - leaving a stale, smaller retained queue
-# in place of a fresher, larger one it should have superseded.
+# Makes snapshot+publish atomic across threads. See README.md#response-thinking-chars-semantics.
 status_publish_lock = threading.Lock()
 
 def publish_status(cli: mqtt.Client, online: bool = True) -> None:
@@ -317,20 +283,8 @@ def on_disconnect(
         log.error(f"Unhandled error in on_disconnect: {e}")
 
 def wait_for_mqtt_connection() -> None:
-    """Block until the MQTT client is genuinely connected, or shutdown
-    is requested.
-
-    client.connect() only sends the CONNECT packet; the CONNACK that
-    flips is_connected() to True is processed asynchronously by the
-    loop thread. Without waiting for it here, a shutdown signal arriving
-    before that CONNACK lands could race the shutdown block's
-    is_connected() check: it could read False (skipping the explicit
-    offline publish) while the CONNACK then lands moments later and lets
-    the eventual disconnect() go out clean - which cancels LWT delivery
-    too. Net effect: no offline announcement at all. handle_exit() also
-    sets connected_event, so a shutdown request wakes this promptly
-    instead of waiting out the full log interval.
-    """
+    """Block until genuinely connected (not just connect() called) or shutdown requested.
+    See README.md#connect-shutdown-races for the race this closes."""
     while not client.is_connected() and not shutdown_event.is_set():
         connected_event.clear()
         if client.is_connected() or shutdown_event.is_set():
@@ -379,16 +333,12 @@ def on_message(cli: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
                 f"(queue depth={request_queue.qsize()})"
             )
         except Exception:
-            # Roll back the tracking entry so the status published below
-            # accurately shows this request never made it into the queue.
+            # Roll back so the status published below shows this request never queued.
             with queue_status_lock:
                 queue_status.pop(seq, None)
             raise
         finally:
-            # Published immediately (not just on the periodic interval) so
-            # the requestor can see their ID land in the queue right away,
-            # or notice its absence if something above removed it again.
-            publish_status(cli)
+            publish_status(cli)  # published immediately, not just on the periodic interval
     except Exception as e:
         log.error(f"Unhandled error in on_message: {e}")
 
@@ -411,10 +361,7 @@ def build_ollama_payload(request: OllamaRequest) -> dict[str, Any]:
     return payload
 
 def stream_ollama_generate(request: OllamaRequest, seq: int | None = None) -> dict[str, Any]:
-    """seq is the caller's queue_status tracking key (None if the caller
-    isn't tracking queue progress for this call, e.g. direct unit tests) -
-    deliberately not request.request_id, which may repeat across requests
-    or be empty and so can't identify anything on its own."""
+    """seq is the queue_status tracking key, not request.request_id. See README.md#request-id-is-not-a-key."""
     payload = build_ollama_payload(request)
     body = json.dumps(payload).encode("utf-8")
 
@@ -431,10 +378,8 @@ def stream_ollama_generate(request: OllamaRequest, seq: int | None = None) -> di
     active_call = ActiveGeneration(conn)
 
     with active_responses_lock:
-        # Checked under the same lock the shutdown block uses to snapshot
-        # and interrupt active_responses, so there's no window where a
-        # request dequeued just as shutdown begins could register after
-        # that snapshot was taken and run uninterrupted to completion.
+        # Same lock the shutdown block uses; closes a register-vs-shutdown race.
+        # See README.md#connect-shutdown-races.
         if shutdown_event.is_set():
             raise GenerationCancelled()
         active_responses[request.request_id] = active_call
@@ -452,16 +397,13 @@ def stream_ollama_generate(request: OllamaRequest, seq: int | None = None) -> di
                 error_body = resp.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"Ollama returned HTTP {resp.status}: {error_body}")
 
-            stream_completed = False
+            stream_completed = False  # see README.md#ollama-stream-parsing
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line:
                     continue
                 chunk = json.loads(line)
                 if not isinstance(chunk, dict):
-                    # Guards chunk.get(...)/final_meta.items() below - a
-                    # non-object line is a protocol violation, not
-                    # something to fail on with a raw AttributeError.
                     raise RuntimeError(f"Ollama sent a non-object chunk: {chunk!r}")
                 chunk_count += 1
 
@@ -495,9 +437,7 @@ def stream_ollama_generate(request: OllamaRequest, seq: int | None = None) -> di
                     break
 
             if not stream_completed:
-                # The connection ended (closed/reset/EOF) before Ollama sent a
-                # final "done" chunk - the caller must not mistake this
-                # truncated output for a complete response.
+                # No final "done" chunk means a truncated stream, not a complete response.
                 raise RuntimeError(
                     f"Ollama stream ended unexpectedly after {chunk_count} chunk(s) "
                     "without a final 'done' marker"
@@ -542,10 +482,7 @@ def ollama_worker() -> None:
             entry = queue_status.get(seq)
             if entry is not None:  # dequeued: response generation started, nothing yet
                 entry["response_chars"] = 0
-                # thinking_chars deliberately stays at -1 here: whether this
-                # request's model streams a "thinking" field at all is only
-                # known once (if ever) one actually shows up in a chunk, in
-                # stream_ollama_generate's thinking_started tracking below.
+                # thinking_chars stays -1 until stream_ollama_generate observes a "thinking" key.
 
         try:
             log.info(f"Calling Ollama for request_id={request.request_id}")
@@ -623,9 +560,7 @@ def handle_exit(signum: int, frame: Any | None) -> None:
     shutdown_event.set()
     connected_event.set()  # wake wait_for_mqtt_connection() promptly too, if it's blocked there
 
-# Registered here, before wait_for_mqtt_connection() is ever called, so a
-# signal arriving while still waiting for the initial connection can
-# interrupt that wait too, not just the final shutdown_event.wait() below.
+# Registered before wait_for_mqtt_connection() so a signal can interrupt that wait too.
 signal.signal(signal.SIGTERM, handle_exit)
 signal.signal(signal.SIGINT, handle_exit)
 
@@ -674,22 +609,14 @@ finally:
     worker_thread.join(timeout=SHUTDOWN_TIMEOUT)
 
     if worker_thread.is_alive():
-        log.warning(
-            f"Worker thread did not finish within {SHUTDOWN_TIMEOUT}s "
-            "even after cancelling; proceeding with shutdown anyway - "
-            "the thread is a daemon and will be discarded on process exit."
-        )
+        log.warning(f"Worker thread did not finish within {SHUTDOWN_TIMEOUT}s; proceeding anyway (daemon thread).")
     else:
         log.debug("Worker thread exited cleanly.")
 
     status_thread.join(timeout=SHUTDOWN_TIMEOUT)
 
     if status_thread.is_alive():
-        log.warning(
-            f"Status publisher thread did not finish within {SHUTDOWN_TIMEOUT}s; "
-            "proceeding with shutdown anyway - the thread is a daemon and will "
-            "be discarded on process exit."
-        )
+        log.warning(f"Status publisher thread did not finish within {SHUTDOWN_TIMEOUT}s; proceeding anyway (daemon thread).")
     else:
         log.debug("Status publisher thread exited cleanly.")
 

@@ -22,7 +22,10 @@ bits (see `tests/conftest.py`, `tests/fixtures/`).
 
 Both scripts were hardened through a dedicated production-readiness pass.
 The patterns below are load-bearing — if a change seems to require breaking
-one of them, stop and reconsider rather than routing around it:
+one of them, stop and reconsider rather than routing around it. Each bullet
+here is the compact, edit-facing version; README.md's Design rationale
+section has the fuller prose explanation for the same points, with inline
+code comments pointing to it by anchor.
 
 - **Unhandled exceptions must not kill the process.** Every paho-mqtt
   callback (`on_connect`, `on_disconnect`, `on_message`) wraps its body in
@@ -38,8 +41,8 @@ one of them, stop and reconsider rather than routing around it:
   packet; the CONNACK that flips `is_connected()` to `True` arrives
   asynchronously on the network loop thread. Both scripts block on
   `wait_for_mqtt_connection()` (an `Event`-based wait, not polling) before
-  doing anything that assumes a live connection — see the docstrings on
-  that function in each file for the exact race it closes.
+  doing anything that assumes a live connection — see README.md's Design
+  rationale section for the exact race it closes.
 - **Uncaught-exceptions-should-crash, on purpose, at the top level.** The
   outermost `try/except` blocks around startup (`client.connect`,
   `loop_start`, worker thread start) deliberately `raise` after logging, so
@@ -49,15 +52,15 @@ one of them, stop and reconsider rather than routing around it:
   single, deterministic shutdown sequence (drain/cancel in-flight work,
   publish offline, `loop_stop()`, `disconnect()`). In `mqtt_llm.py`, in-flight
   Ollama HTTP requests are interrupted by directly `shutdown(SOCK_RDWR)`-ing
-  the captured raw socket (see `ActiveGeneration` docstring for why
+  the captured raw socket (see README.md's Design rationale section for why
   `HTTPConnection.sock` can't be relied on once streaming starts), then
   `worker_thread.join(timeout=SHUTDOWN_TIMEOUT)` with a daemon-thread
   fallback so shutdown can't hang forever.
 - **Locking**: `active_responses_lock` in `mqtt_llm.py` protects
   `active_responses` end-to-end — registering a call and checking
   `shutdown_event` happen under the *same* lock acquisition specifically to
-  close a register-vs-shutdown race (see the comment at the top of
-  `stream_ollama_generate`). Preserve that pairing if you touch this path.
+  close a register-vs-shutdown race (see README.md's Design rationale
+  section). Preserve that pairing if you touch this path.
 - **CLI validation happens at argparse time** (`_port_type`,
   `_positive_int`/`_positive_float`), not deep in the code — bad input
   should fail immediately and clearly at startup, not surface later as an
@@ -124,6 +127,13 @@ one of them, stop and reconsider rather than routing around it:
     Another real, reported bug: it used to default to `0` alongside
     `response_chars` the moment a request started, even for models that
     never stream a `"thinking"` field at all.
+- **Ollama stream parsing is defensive, not permissive.**
+  `stream_ollama_generate` treats a non-object NDJSON chunk, and a
+  connection that ends without a final `"done"` chunk, as errors rather
+  than something to fail on cryptically (`AttributeError` from
+  `chunk.get(...)`) or, worse, return as a silently truncated response. See
+  README.md's Design rationale section for the specific failure this
+  guards against.
 
 If you extend either script, keep new code inside these same invariants
 (caught-and-logged callback errors, explicit offline publish on clean exit,
@@ -140,10 +150,11 @@ an internal id rather than by the caller-supplied `request_id`).
   decision (see the comment above `[tool.ruff]` in `pyproject.toml`). If a
   tool or auto-fix wants to reflow lines, drop it or scope it down rather
   than accepting the reflow.
-- Comments explain *why*, not *what* — matching the docstrings/comments
-  already in both scripts (e.g. the `ActiveGeneration` and
-  `wait_for_mqtt_connection` docstrings). Don't add comments that restate
-  the code.
+- Comments and docstrings are deliberately terse — a line or two at most,
+  pointing at README.md's Design rationale section (`# see README.md#...`)
+  for anything that needs more than that. Don't restate the code, and
+  don't reintroduce long inline explanations; extend the README section
+  instead, and keep CLAUDE.md's own invariants above in sync with it.
 - Modern typing: `X | None` not `Optional[X]`, `dict[...]`/`list[...]` not
   `Dict[...]`/`List[...]` (enforced by Ruff's `UP` rules).
 - paho-mqtt callbacks must use paho's real typed signatures
