@@ -102,11 +102,34 @@ one of them, stop and reconsider rather than routing around it:
     fires it in its own daemon thread, best-effort, so a stuck close can
     only delay that one instance's cleanup, never recovery or shutdown.
     Don't "simplify" this back to an inline `jetsonTop.close()` call.
+- **The status/queue feature in `mqtt_llm.py` never keys anything by
+  `request_id`.** `request_id` is caller-supplied and pydantic only
+  validates it as `str` — not for uniqueness or non-emptiness — so treat it
+  as an arbitrary label, never an identity. `queue_status` is keyed by an
+  internal `_queue_seq_counter` value assigned per request at enqueue time;
+  `request_id` is carried inside each entry purely to report back. Two (or
+  two hundred) queued requests sharing one `request_id`, or all using `""`,
+  must still track as independent queue entries — this was a real,
+  reported bug (duplicate-ID requests collapsing onto one `queue_status`
+  entry) before it was fixed by switching the key. Two related invariants
+  worth keeping straight:
+  - `publish_status()` wraps snapshot-then-publish in `status_publish_lock`
+    as one atomic unit across every thread that calls it (`on_message`,
+    `ollama_worker`, `status_publisher`) — without it, two concurrent
+    publishes could interleave so a stale, smaller snapshot reaches the
+    broker *after* a fresher, larger one and overwrites it.
+  - `thinking_chars`'s `-1` means both "queued" (like `response_chars`)
+    *and* "no thinking activity observed yet" — it only leaves `-1` once
+    `stream_ollama_generate` actually sees a `"thinking"` key in a chunk.
+    Another real, reported bug: it used to default to `0` alongside
+    `response_chars` the moment a request started, even for models that
+    never stream a `"thinking"` field at all.
 
 If you extend either script, keep new code inside these same invariants
 (caught-and-logged callback errors, explicit offline publish on clean exit,
 event-based waits instead of polling, fail-fast CLI validation, retry
-dependency outages in-process rather than crashing).
+dependency outages in-process rather than crashing, track queue state by
+an internal id rather than by the caller-supplied `request_id`).
 
 ## Code style
 

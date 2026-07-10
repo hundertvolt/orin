@@ -25,9 +25,14 @@ def test_on_connect_success_subscribes_and_announces_online(loaded_module):
     m.on_connect(cli, None, {}, 0, None)
 
     cli.subscribe.assert_called_once_with(f"{m.MQTT_TOPIC}/request", qos=1)
-    cli.publish.assert_called_once_with(
-        m.MQTT_STATUS_TOPIC, json.dumps({"status": "online"}), qos=1, retain=True
-    )
+    cli.publish.assert_called_once()
+    topic, payload = cli.publish.call_args.args
+    assert cli.publish.call_args.kwargs == {"qos": 1, "retain": True}
+    assert topic == m.MQTT_STATUS_TOPIC
+    body = json.loads(payload)
+    assert body["status"] == "online"
+    assert body["queue"] == []
+    assert isinstance(body["heartbeat"], int)
 
 
 def test_on_connect_failure_does_not_subscribe_or_publish(loaded_module):
@@ -53,13 +58,16 @@ def test_on_connect_swallows_subscribe_exception(loaded_module, caplog):
 
 
 def test_on_connect_swallows_publish_exception(loaded_module, caplog):
+    """publish_status() swallows its own exceptions (same pattern as the
+    existing publish_response()), so a publish failure here surfaces as a
+    'Failed to publish status' log, not as an escape from on_connect."""
     m = loaded_module
     cli = MagicMock()
     cli.publish.side_effect = OSError("no route to host")
 
     m.on_connect(cli, None, {}, 0, None)  # must not raise
 
-    assert "Unhandled error in on_connect" in caplog.text
+    assert "Failed to publish status" in caplog.text
 
 
 # ------------------------------
@@ -111,7 +119,8 @@ def test_on_message_valid_request_is_queued(loaded_module):
     m.on_message(MagicMock(), None, _msg(payload))
 
     assert m.request_queue.qsize() == 1
-    queued = m.request_queue.get_nowait()
+    seq, queued = m.request_queue.get_nowait()
+    assert isinstance(seq, int)
     assert isinstance(queued, m.OllamaRequest)
     assert queued.request_id == "abc-123"
     assert queued.model == "llama3"
@@ -131,7 +140,7 @@ def test_on_message_optional_fields_pass_through(loaded_module):
 
     m.on_message(MagicMock(), None, _msg(payload))
 
-    queued = m.request_queue.get_nowait()
+    _seq, queued = m.request_queue.get_nowait()
     assert queued.to_ollama_options() == {"temperature": 0.5, "top_p": 0.9, "top_k": 40}
 
 
@@ -199,3 +208,48 @@ def test_on_message_swallows_unexpected_downstream_exception(loaded_module, monk
     m.on_message(MagicMock(), None, _msg(payload))  # must not raise
 
     assert "Unhandled error in on_message" in caplog.text
+
+
+# ------------------------------
+# on_message: queue_status tracking + immediate status publish
+# ------------------------------
+
+def test_on_message_registers_queue_status_entry_and_publishes_status(loaded_module):
+    m = loaded_module
+    cli = MagicMock()
+    payload = json.dumps({
+        "request_id": "q-1", "model": "llama3", "system": "s", "user": "u",
+    }).encode("utf-8")
+
+    m.on_message(cli, None, _msg(payload))
+
+    assert list(m.queue_status.values()) == [
+        {"request_id": "q-1", "response_chars": -1, "thinking_chars": -1}
+    ]
+
+    cli.publish.assert_called_once()
+    topic, published_payload = cli.publish.call_args.args
+    assert topic == m.MQTT_STATUS_TOPIC
+    body = json.loads(published_payload)
+    assert body["queue"] == [{"request_id": "q-1", "response_chars": -1, "thinking_chars": -1}]
+
+
+def test_on_message_rolls_back_queue_status_when_put_fails(loaded_module, monkeypatch):
+    """If request_queue.put() fails after the tracking entry was added, the
+    entry must be removed again - so the status published right after
+    accurately shows the request never made it into the queue, instead of
+    a phantom entry that will now sit there forever."""
+    m = loaded_module
+    cli = MagicMock()
+    monkeypatch.setattr(m.request_queue, "put", MagicMock(side_effect=RuntimeError("queue is broken")))
+
+    payload = json.dumps({
+        "request_id": "q-2", "model": "llama3", "system": "s", "user": "u",
+    }).encode("utf-8")
+
+    m.on_message(cli, None, _msg(payload))  # must not raise
+
+    assert m.queue_status == {}
+    cli.publish.assert_called_once()
+    body = json.loads(cli.publish.call_args.args[1])
+    assert body["queue"] == []

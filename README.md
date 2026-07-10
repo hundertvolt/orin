@@ -52,6 +52,7 @@ The integration tests spin up a real local Mosquitto broker as a subprocess, so 
 | `--connect-timeout` | `5.0` | Max seconds to establish the Ollama TCP connection |
 | `--stream-timeout` | `120.0` | Max seconds of silence between streamed chunks before giving up |
 | `--shutdown-timeout` | `5.0` | Max seconds to wait for in-flight work to finish on shutdown |
+| `--interval` | `10` | Status message publish interval in seconds |
 | `--loglevel` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
 
 </details>
@@ -72,7 +73,22 @@ The integration tests spin up a real local Mosquitto broker as a subprocess, so 
   ```
   `error_code`: `0` OK, `1` invalid JSON, `2` schema validation error, `3` Ollama error.
 
-- **`{topic}/status`** (published, qos 1, retained) - presence: `{"status": "online"}` / `{"status": "offline"}`. Set as the MQTT Last Will so an ungraceful exit (crash, power loss, `kill -9`) is still announced; a clean shutdown also publishes the offline status explicitly, since a graceful disconnect cancels LWT delivery.
+- **`{topic}/status`** (published, qos 1, retained) - presence plus the current request queue:
+  ```json
+  {
+    "status": "online", "heartbeat": 1735689600,
+    "queue": [
+      {"request_id": "abc123", "response_chars": -1, "thinking_chars": -1},
+      {"request_id": "def456", "response_chars": 0, "thinking_chars": -1},
+      {"request_id": "ghi789", "response_chars": 42, "thinking_chars": 17}
+    ]
+  }
+  ```
+  `queue` lists every request not yet fully processed, in the order it will be (or is being) processed. Each entry's `response_chars`/`thinking_chars` track that request's own generation progress independently (a "thinking" phase and a final-response phase can advance separately for reasoning models). `response_chars` is `-1` queued but not yet started, `0` started but no response text generated yet, otherwise the response character count so far. `thinking_chars` follows the same `-1`/`0`/count shape, but since not every model streams a "thinking" field at all, `-1` also covers "no thinking activity observed for this request yet" - it only leaves `-1` once Ollama actually sends one (even an empty one, which reads as `0`), and simply stays `-1` for the whole request if the model never does. `heartbeat` is `int(time.time())` at publish time, so a subscriber can tell a retained message apart from a live one.
+
+  Published on the same schedule as `mqtt_telemetry.py`'s telemetry (every `--interval` seconds), plus immediately whenever a request is enqueued or finishes (successfully, with an error, or cancelled by shutdown) - so a requestor can see their `request_id` land in the queue right away, or notice it disappear again without a normal `{topic}/response` reply (e.g. an error that pulled it back out before it ever ran).
+
+  When offline (either the MQTT Last Will firing on an ungraceful exit, or the explicit publish during a clean shutdown), `heartbeat` and `queue` are `null` - `status` is the only field guaranteed meaningful at that point. A clean shutdown also publishes this offline payload explicitly, since a graceful disconnect cancels LWT delivery.
 
 </details>
 
